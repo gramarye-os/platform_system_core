@@ -182,6 +182,7 @@ ContainerManager::ContainerManager() {
     mkdir(SHARED_OPENCLAW_DEV, 0770);
     mkdir(SHARED_UDA, 0770);
     mCgroup_.loadConfig(AOHP_CGROUP_CONF);
+    mCgroup_.loadPowerMode();
     mUnits_.reset(new UnitManager(*this));
 }
 
@@ -659,6 +660,7 @@ int ContainerManager::forkIntoContainer(const std::string& containerName, const 
             _exit(125);
         }
         mCgroup_.joinContainerCgroup(containerName, getpid());
+        mCgroup_.joinCpuset(getpid());
 
         if (chroot(rootfs.c_str()) != 0) {
             PLOG(ERROR) << "chroot " << rootfs;
@@ -730,6 +732,7 @@ ExecResult ContainerManager::execSync(const std::string& name, const std::string
         }
         // Best-effort cgroup; failures are logged inside joinContainerCgroup (never stderr).
         mCgroup_.joinContainerCgroup(name, getpid());
+        mCgroup_.joinCpuset(getpid());
 
         if (chroot(rootfs.c_str()) != 0) {
             _exit(126);
@@ -1083,6 +1086,7 @@ pid_t ContainerManager::spawnInContainer(const std::string& name, const SpawnSpe
         // Host-exec units join the env's cgroup too: stop/KillMode/restart accounting are the same, and the
         // helper dies with the env.
         mCgroup_.joinContainerCgroup(name, getpid());
+        mCgroup_.joinCpuset(getpid());
         if (!spec.host && chroot(rootfs.c_str()) != 0) {
             const char m = 126;
             write(syncPipe[1], &m, 1);

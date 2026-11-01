@@ -217,6 +217,78 @@ bool CgroupController::joinContainerCgroup(const std::string& containerName, pid
     return true;
 }
 
+static constexpr const char* kPowerModeFile = "/data/aohp/power";
+
+bool CgroupController::parsePowerMode(const std::string& s, PowerMode* out) {
+    if (s == "performance" || s == "perf") { *out = PowerMode::kPerformance; return true; }
+    if (s == "saver" || s == "background") { *out = PowerMode::kSaver; return true; }
+    return false;
+}
+
+void CgroupController::loadPowerMode() {
+    PowerMode m;
+    if (parsePowerMode(readFileTrim(kPowerModeFile), &m)) mPowerMode_ = m;
+    LOG(INFO) << "power mode " << powerModeName(mPowerMode_);
+}
+
+bool CgroupController::setPowerMode(PowerMode m) {
+    mPowerMode_ = m;
+    // writeFile() is O_WRONLY for cgroup knobs; the mode file has to be created.
+    int fd = open(kPowerModeFile, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        PLOG(WARNING) << "persist power mode " << kPowerModeFile;
+    } else {
+        std::string s = std::string(powerModeName(m)) + "\n";
+        if (write(fd, s.data(), s.size()) != static_cast<ssize_t>(s.size())) PLOG(WARNING) << "write " << kPowerModeFile;
+        close(fd);
+    }
+    LOG(INFO) << "power mode -> " << powerModeName(m);
+    return true;
+}
+
+void CgroupController::joinCpuset(pid_t pid) const {
+    const char* tasks = cpusetFor(mPowerMode_);
+    if (access(tasks, W_OK) != 0) return;  // no Android cpuset hierarchy (Cuttlefish without it): inherit
+    if (!writeFile(tasks, std::to_string(static_cast<int>(pid)) + "\n")) {
+        PLOG(WARNING) << "cpuset join failed " << tasks << " pid " << pid;
+    }
+}
+
+void CgroupController::applyCpusetToContainer(const std::string& containerName) const {
+    if (!mEnabled_ || !mV2Detected_) return;
+    applyCpusetToProcs(cgroupPathFor(containerName) + "/cgroup.procs", containerName);
+}
+
+// Every process the daemon ever spawned - containers, exec sessions, units, HostExec helpers and their
+// orphaned grandchildren - stays in the cgroup v2 group init/libprocessgroup created for the daemon
+// service itself (/proc/self/cgroup "0::/system/uid_0/pid_N"), whether or not the per-env cgroups are
+// usable on this device (they are not on dodge: the root does not delegate). That group is the reliable
+// enumeration for a power-mode switch.
+void CgroupController::applyCpusetToAll() const {
+    std::ifstream self("/proc/self/cgroup");
+    std::string line, path;
+    while (std::getline(self, line)) {
+        if (line.rfind("0::", 0) == 0) { path = line.substr(3); break; }
+    }
+    if (path.empty()) { LOG(WARNING) << "no cgroup v2 path for self"; return; }
+    applyCpusetToProcs("/sys/fs/cgroup" + path + "/cgroup.procs", "daemon group " + path);
+}
+
+void CgroupController::applyCpusetToProcs(const std::string& procsFile, const std::string& what) const {
+    std::ifstream in(procsFile);
+    std::string line;
+    int moved = 0;
+    pid_t self = getpid();
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        pid_t pid = static_cast<pid_t>(std::stoi(line));
+        if (pid == self) continue;  // the daemon stays in system-background
+        joinCpuset(pid);
+        moved++;
+    }
+    LOG(INFO) << "cpuset " << powerModeName(mPowerMode_) << " applied to " << moved << " processes (" << what << ")";
+}
+
 std::string CgroupController::getUsageJson(const std::string& containerName) const {
     std::string cg = cgroupPathFor(containerName);
     struct stat st;

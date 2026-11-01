@@ -43,6 +43,7 @@ constexpr const char* CMD_LIST_SVC      = "LIST_SVC";
 constexpr const char* CMD_SVC_LOG       = "SVC_LOG";
 constexpr const char* CMD_USAGE         = "USAGE";
 constexpr const char* CMD_DIAG          = "DIAG";
+constexpr const char* CMD_POWER         = "POWER";      // POWER [performance|saver] -> OK {"mode":...}
 // UNIT <env> <op> [<base64 json>]: systemd-subset unit ops (unit_manager.h); OK <json> | ERR <msg>
 constexpr const char* CMD_UNIT          = "UNIT";
 

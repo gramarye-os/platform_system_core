@@ -14,6 +14,7 @@
 #include "unit_manager.h"
 
 #include <cerrno>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -210,6 +211,24 @@ static void handleClient(int clientFd) {
             std::string js = gMgr.diagnose(tokens[1]);
             response = std::string(RESP_OK) + " " + js + "\n";
 
+        } else if (cmd == CMD_POWER) {
+            // POWER [performance|saver]  ->  OK {"mode":...}  Which cpuset env processes run in; setting it
+            // moves every live process of every container (the daemon itself stays in system-background).
+            auto& cg = gMgr.cgroup();
+            if (tokens.size() >= 2) {
+                CgroupController::PowerMode pm;
+                if (!CgroupController::parsePowerMode(tokens[1], &pm)) {
+                    response = std::string(RESP_ERR) + " unknown power mode\n";
+                } else {
+                    cg.setPowerMode(pm);
+                    cg.applyCpusetToAll();
+                    for (const auto& name : gMgr.listContainers()) cg.applyCpusetToContainer(name);
+                }
+            }
+            if (response.empty()) {
+                response = std::string(RESP_OK) + " {\"mode\":\"" + CgroupController::powerModeName(cg.powerMode()) + "\"}\n";
+            }
+
         } else if (cmd == CMD_UNIT && tokens.size() >= 3) {
             // UNIT <env> <op> [<base64 json args>]  ->  OK <json> | ERR <message>
             std::string args = tokens.size() >= 4 ? base64Decode(tokens[3]) : "{}";
@@ -272,6 +291,9 @@ static int runClient(const std::string& line, const std::string& sockPath) {
 }
 
 int main(int argc, char** argv) {
+    // A response written to a control socket the client has already closed (e.g. a multi-line EXEC
+    // command parsed as several requests) must not kill the daemon - and with it every env.
+    signal(SIGPIPE, SIG_IGN);
     std::string clientLine, sockPath = "/dev/socket/aohp_container", bindPath;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
