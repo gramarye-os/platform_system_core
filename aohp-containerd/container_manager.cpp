@@ -29,6 +29,10 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/mount.h>
+#include <sys/syscall.h>
+#ifdef __BIONIC__
+#include <linux/mount.h>  // struct mount_attr; glibc >= 2.36 has it in <sys/mount.h> (hosttest)
+#endif
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -535,7 +539,30 @@ bool ContainerManager::resetContainer(const std::string& name) {
     return true;
 }
 
+// Android mounts /data nosuid,nodev and every env's rootfs lives under /data/aohp, so setuid
+// programs (sudo, su, ...) run without privilege in every env ("effective uid is not 0").
+// In this child's private mount namespace, bind the rootfs onto itself and clear only
+// MOUNT_ATTR_NOSUID on that bind with mount_setattr(2) (Linux 5.12+). The host's /data mount is
+// untouched, and a setuid-root program in the env still gets only this domain's capability
+// bounding set and SELinux context, i.e. what env root already has. mount_setattr() goes through
+// no LSM remount hook, so no labeledfs:filesystem remount grant is needed (MS_REMOUNT would);
+// the self-bind needs aohp_container_data_file:dir mounton, which the policy already has.
+// Best effort: if either step fails the env runs as before, just without setuid.
+static void allowSetuidInRootfs(const std::string& rootfs) {
+    if (mount(rootfs.c_str(), rootfs.c_str(), nullptr, MS_BIND, nullptr) != 0) {
+        PLOG(WARNING) << "self-bind " << rootfs << " (for setuid) failed";
+        return;
+    }
+    struct mount_attr attr = {};
+    attr.attr_clr = MOUNT_ATTR_NOSUID;
+    if (syscall(__NR_mount_setattr, AT_FDCWD, rootfs.c_str(), 0, &attr, sizeof(attr)) != 0) {
+        PLOG(WARNING) << "mount_setattr(clear nosuid) " << rootfs << " failed";
+    }
+}
+
 bool ContainerManager::setupBindMounts(const std::string& rootfs) {
+    allowSetuidInRootfs(rootfs);
+
     auto doMount = [&](const char* src, const char* rel, unsigned long flags) -> bool {
         std::string target = rootfs + rel;
         if (!ensureDir(target, 0755)) return false;
