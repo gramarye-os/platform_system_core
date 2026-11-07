@@ -417,6 +417,21 @@ void ContainerManager::killContainerProcesses(const std::string& rootfs) {
     usleep(100000);
 }
 
+std::string ContainerManager::envOfPid(pid_t pid) {
+    if (pid <= 1) return "";
+    char link[PATH_MAX];
+    std::string rootLink = "/proc/" + std::to_string(pid) + "/root";
+    ssize_t len = readlink(rootLink.c_str(), link, sizeof(link) - 1);
+    if (len <= 0) return "";
+    link[len] = '\0';
+    std::string root(link);
+    for (const auto& name : listContainers()) {
+        const std::string rootfs = rootfsPath(name);
+        if (root == rootfs || root.compare(0, rootfs.size() + 1, rootfs + "/") == 0) return name;
+    }
+    return "";
+}
+
 bool ContainerManager::teardownBindMounts(const std::string& rootfs) {
     const char* mounts[] = {
             "/etc/resolv.conf",

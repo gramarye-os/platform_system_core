@@ -229,6 +229,14 @@ static void handleClient(int clientFd) {
                 response = std::string(RESP_OK) + " {\"mode\":\"" + CgroupController::powerModeName(cg.powerMode()) + "\"}\n";
             }
 
+        } else if (cmd == CMD_WHICHENV && tokens.size() >= 2) {
+            // WHICHENV <pid>  ->  OK {"env":"<name>"} | ERR not in an env
+            char* endp = nullptr;
+            long pid = strtol(tokens[1].c_str(), &endp, 10);
+            std::string env = (endp && *endp == '\0' && pid > 1) ? gMgr.envOfPid(static_cast<pid_t>(pid)) : "";
+            response = env.empty() ? std::string(RESP_ERR) + " not in an env\n"
+                                   : std::string(RESP_OK) + " {\"env\":\"" + env + "\"}\n";
+
         } else if (cmd == CMD_UNIT && tokens.size() >= 3) {
             // UNIT <env> <op> [<base64 json args>]  ->  OK <json> | ERR <message>
             std::string args = tokens.size() >= 4 ? base64Decode(tokens[3]) : "{}";

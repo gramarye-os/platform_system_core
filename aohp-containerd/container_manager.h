@@ -83,6 +83,11 @@ private:
     std::unique_ptr<UnitManager> mUnits_;
 
     std::string rootfsPath(const std::string& name);
+    // Name of the env whose rootfs is <pid>'s root directory (chroot), or "" when the pid is not an
+    // env process. Used by the Driver's credential broker to turn a SO_PEERCRED pid into an
+    // "env:<name>" principal: every env process is uid 0 in the host uid space, so the uid alone
+    // cannot tell envs apart (or apart from host root).
+    std::string envOfPid(pid_t pid);
     std::string envPath(const std::string& name);
     std::string templatePath(const std::string& templateName);
     std::string templateRecordPath(const std::string& name);
