@@ -56,8 +56,8 @@ public:
     const std::string& getLastError() const { return mLastError_; }
 
     /**
-     * Fork one process into the container: own session + process group (pgid == pid), fresh
-     * mount namespace with the standard binds, env cgroup, chroot, chdir(workDir), stdout/stderr
+     * Fork one process into the container: own session + process group (pgid == pid), the env's
+     * mount namespace (built by the first entry, see container_manager.cpp), env cgroup, env root, chdir(workDir), stdout/stderr
      * to logPath, daemon fds closed, execve(argv, env). The caller owns waitpid().
      * Returns the pid or -1 (error text in *err). No --jitless injection.
      */
@@ -86,6 +86,21 @@ private:
 
     CgroupController mCgroup_;
     std::unique_ptr<UnitManager> mUnits_;
+
+    // One mount namespace per env (see "per-env mount namespace" in container_manager.cpp): an nsfs
+    // fd pinning /proc/<first child>/ns/mnt, absent until an entry has built it.
+    std::mutex mEnvNsMutex_;
+    std::map<std::string, int> mEnvNsFd_;
+    int envNsFd(const std::string& name);
+    void pinEnvNs(const std::string& name, pid_t pid);
+    void dropEnvNs(const std::string& name);
+    void repinEnvNsFromPid(const std::string& name, pid_t pid);
+    // Child side of an env entry: join the pinned namespace or build a new one, report on readyFd,
+    // wait for the parent's go byte. Parent side: read the report, put the child in the env cgroup,
+    // pin the namespace when it is new, send go. Together they replace the unshare / binds / cgroup /
+    // pivot sequence each entry point used to run by itself.
+    bool childEnterEnv(const std::string& rootfs, int pinnedFd, int readyFd, int goFd);
+    void parentAdmitEnv(const std::string& name, pid_t pid, int readyFd, int goFd);
 
     std::string rootfsPath(const std::string& name);
     std::string envPath(const std::string& name);

@@ -459,6 +459,7 @@ bool ContainerManager::teardownBindMounts(const std::string& rootfs) {
 bool ContainerManager::destroyContainer(const std::string& name) {
     mLastError_.clear();
     mUnits_->forgetEnv(name);
+    dropEnvNs(name);
     {
         std::lock_guard<std::mutex> lock(mWorkDirMutex_);
         mWorkDir_.erase(name);
@@ -494,6 +495,7 @@ bool ContainerManager::destroyContainer(const std::string& name) {
 
 bool ContainerManager::resetContainer(const std::string& name) {
     mUnits_->forgetEnv(name);
+    dropEnvNs(name);
     {
         std::lock_guard<std::mutex> lock(mWorkDirMutex_);
         mWorkDir_.erase(name);
@@ -717,6 +719,113 @@ bool ContainerManager::setupBindMounts(const std::string& rootfs) {
     return true;
 }
 
+// ---- per-env mount namespace ---------------------------------------------------------------------
+// Each entry into an env (unit start, "aohp sandbox exec", shell) used to build its own mount
+// namespace: unshare, make-rslave, binds, pivot_root. A mount made by one entry was invisible to
+// the next, which broke everything that mounts for later: podman's /run/netns/<id> nsfs binds
+// (netavark's teardown, run from a later entry, opened the bare placeholder file, got setns EINVAL
+// and left its DNAT rules behind - a published port then answered "No route to host" once another
+// container reused it, 2026-11-09), the "per container" /dev/shm tmpfs that was really per entry
+// (two units could not share POSIX shm), and the cgroup2 / mqueue / devpts instances mounted anew
+// each time. Now the first entry builds the namespace and the daemon pins it with an fd on
+// /proc/<child>/ns/mnt; every later entry setns(2)s into it. The pin keeps the namespace and its
+// mounts alive with zero processes; destroy/reset drop it; after a daemon restart
+// adoptOrphanServicePids() re-pins from a surviving unit pid.
+
+int ContainerManager::envNsFd(const std::string& name) {
+    std::lock_guard<std::mutex> lock(mEnvNsMutex_);
+    auto it = mEnvNsFd_.find(name);
+    return it == mEnvNsFd_.end() ? -1 : it->second;
+}
+
+void ContainerManager::pinEnvNs(const std::string& name, pid_t pid) {
+    std::string p = "/proc/" + std::to_string(pid) + "/ns/mnt";
+    int fd = open(p.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        PLOG(WARNING) << "env " << name << ": pin mount namespace " << p;
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mEnvNsMutex_);
+    if (mEnvNsFd_.count(name)) {
+        // Two first entries raced; the one pinned already wins, the other namespace is one-off.
+        close(fd);
+        return;
+    }
+    mEnvNsFd_[name] = fd;
+    LOG(INFO) << "env " << name << ": mount namespace pinned from pid " << pid;
+}
+
+void ContainerManager::dropEnvNs(const std::string& name) {
+    std::lock_guard<std::mutex> lock(mEnvNsMutex_);
+    auto it = mEnvNsFd_.find(name);
+    if (it == mEnvNsFd_.end()) return;
+    close(it->second);
+    mEnvNsFd_.erase(it);
+    LOG(INFO) << "env " << name << ": mount namespace dropped";
+}
+
+// Daemon restart: the pins are gone but unit processes may still run in the old namespace. Adopt
+// it from the first live env pid so later entries see the same mounts. HostExec units share the
+// daemon's own mount namespace and are skipped.
+void ContainerManager::repinEnvNsFromPid(const std::string& name, pid_t pid) {
+    if (envNsFd(name) >= 0) return;
+    char self[64], other[64];
+    std::string p = "/proc/" + std::to_string(pid) + "/ns/mnt";
+    ssize_t a = readlink("/proc/self/ns/mnt", self, sizeof(self) - 1);
+    ssize_t b = readlink(p.c_str(), other, sizeof(other) - 1);
+    if (a <= 0 || b <= 0) return;
+    self[a] = '\0';
+    other[b] = '\0';
+    if (strcmp(self, other) == 0) return;
+    pinEnvNs(name, pid);
+}
+
+bool ContainerManager::childEnterEnv(const std::string& rootfs, int pinnedFd, int readyFd, int goFd) {
+    char what = 'N';
+    if (pinnedFd >= 0 && setns(pinnedFd, CLONE_NEWNS) == 0) {
+        // setns(CLONE_NEWNS) moves root and cwd to the namespace's root. When the first entry had to
+        // fall back to chroot that root is still the host's; the rootfs path then resolves and we
+        // chroot like it did.
+        struct stat st;
+        if (stat(rootfs.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && chroot(rootfs.c_str()) != 0) {
+            PLOG(ERROR) << "chroot " << rootfs << " after joining the env mount namespace";
+            return false;
+        }
+        if (chdir("/") != 0) PLOG(WARNING) << "chdir / after joining the env mount namespace";
+        what = 'J';
+    } else {
+        if (pinnedFd >= 0) PLOG(WARNING) << "setns(env mount namespace) failed; building a new one";
+        tryUnshareMountNs();
+        if (!setupBindMounts(rootfs)) return false;
+        if (!enterRootfs(rootfs)) return false;
+    }
+    if (readyFd >= 0) {
+        TEMP_FAILURE_RETRY(write(readyFd, &what, 1));
+        close(readyFd);
+    }
+    if (goFd >= 0) {
+        char go = 0;
+        TEMP_FAILURE_RETRY(read(goFd, &go, 1));
+        close(goFd);
+    }
+    return true;
+}
+
+void ContainerManager::parentAdmitEnv(const std::string& name, pid_t pid, int readyFd, int goFd) {
+    char what = 0;
+    ssize_t n = TEMP_FAILURE_RETRY(read(readyFd, &what, 1));
+    close(readyFd);
+    if (n == 1) {
+        // Before the go byte the child has not exec'd, so every descendant inherits this membership.
+        mCgroup_.joinContainerCgroup(name, pid);
+        mCgroup_.joinCpuset(pid);
+        if (what == 'N') pinEnvNs(name, pid);
+    }
+    char go = 1;
+    TEMP_FAILURE_RETRY(write(goFd, &go, 1));
+    close(goFd);
+}
+
 int ContainerManager::forkIntoContainer(const std::string& containerName, const std::string& rootfs,
                                        const char* const argv[], bool usePty) {
     int masterFd = -1;
@@ -728,6 +837,17 @@ int ContainerManager::forkIntoContainer(const std::string& containerName, const 
             return -1;
         }
     }
+
+    int readyPipe[2], goPipe[2];
+    if (pipe2(readyPipe, O_CLOEXEC) != 0 || pipe2(goPipe, O_CLOEXEC) != 0) {
+        PLOG(ERROR) << "pipe2";
+        if (!usePty) {
+            close(pipeFds[0]);
+            close(pipeFds[1]);
+        }
+        return -1;
+    }
+    const int pinnedFd = envNsFd(containerName);
 
     pid_t pid;
     if (usePty) {
@@ -742,15 +862,10 @@ int ContainerManager::forkIntoContainer(const std::string& containerName, const 
     }
 
     if (pid == 0) {
-        tryUnshareMountNs();
-        if (!setupBindMounts(rootfs)) {
+        close(readyPipe[0]);
+        close(goPipe[1]);
+        if (!childEnterEnv(rootfs, pinnedFd, readyPipe[1], goPipe[0])) {
             _exit(125);
-        }
-        mCgroup_.joinContainerCgroup(containerName, getpid());
-        mCgroup_.joinCpuset(getpid());
-
-        if (!enterRootfs(rootfs)) {
-            _exit(126);
         }
 
         setContainerChildCommonEnv();
@@ -765,6 +880,10 @@ int ContainerManager::forkIntoContainer(const std::string& containerName, const 
         execvp(argv[0], const_cast<char* const*>(argv));
         _exit(127);
     }
+
+    close(readyPipe[1]);
+    close(goPipe[0]);
+    parentAdmitEnv(containerName, pid, readyPipe[0], goPipe[1]);
 
     if (usePty) {
         return masterFd;
@@ -793,11 +912,13 @@ ExecResult ContainerManager::execSync(const std::string& name, const std::string
         }
     }
 
-    int stdoutPipe[2], stderrPipe[2];
-    if (pipe(stdoutPipe) < 0 || pipe(stderrPipe) < 0) {
+    int stdoutPipe[2], stderrPipe[2], readyPipe[2], goPipe[2];
+    if (pipe(stdoutPipe) < 0 || pipe(stderrPipe) < 0 || pipe2(readyPipe, O_CLOEXEC) < 0 ||
+        pipe2(goPipe, O_CLOEXEC) < 0) {
         result.stderrStr = "pipe() failed";
         return result;
     }
+    const int pinnedFd = envNsFd(name);
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -808,19 +929,13 @@ ExecResult ContainerManager::execSync(const std::string& name, const std::string
     if (pid == 0) {
         close(stdoutPipe[0]);
         close(stderrPipe[0]);
+        close(readyPipe[0]);
+        close(goPipe[1]);
 
-        tryUnshareMountNs();
-        if (!setupBindMounts(rootfs)) {
-            const char* msg = "aohp-containerd: setupBindMounts failed\n";
+        if (!childEnterEnv(rootfs, pinnedFd, readyPipe[1], goPipe[0])) {
+            const char* msg = "aohp-containerd: entering the env failed\n";
             write(stderrPipe[1], msg, strlen(msg));
             _exit(125);
-        }
-        // Best-effort cgroup; failures are logged inside joinContainerCgroup (never stderr).
-        mCgroup_.joinContainerCgroup(name, getpid());
-        mCgroup_.joinCpuset(getpid());
-
-        if (!enterRootfs(rootfs)) {
-            _exit(126);
         }
 
         setContainerChildCommonEnv();
@@ -847,6 +962,9 @@ ExecResult ContainerManager::execSync(const std::string& name, const std::string
 
     close(stdoutPipe[1]);
     close(stderrPipe[1]);
+    close(readyPipe[1]);
+    close(goPipe[0]);
+    parentAdmitEnv(name, pid, readyPipe[0], goPipe[1]);
 
     auto readAll = [](int fd) -> std::string {
         std::string out;
@@ -1085,6 +1203,8 @@ void ContainerManager::adoptOrphanServicePids() {
             if (kill(static_cast<pid_t>(pid), 0) != 0) {
                 LOG(INFO) << "Removing stale pid file " << path << " for dead pid " << pid;
                 unlink(path.c_str());
+            } else {
+                repinEnvNsFromPid(name, static_cast<pid_t>(pid));
             }
         }
         closedir(d);
@@ -1116,12 +1236,14 @@ pid_t ContainerManager::spawnInContainer(const std::string& name, const SpawnSpe
     for (const auto& e : spec.env) envp.push_back(const_cast<char*>(e.c_str()));
     envp.push_back(nullptr);
 
-    int syncPipe[2];
-    if (pipe2(syncPipe, O_CLOEXEC) != 0) {
+    int syncPipe[2], readyPipe[2], goPipe[2];
+    if (pipe2(syncPipe, O_CLOEXEC) != 0 || pipe2(readyPipe, O_CLOEXEC) != 0 ||
+        pipe2(goPipe, O_CLOEXEC) != 0) {
         if (err) *err = "pipe failed";
         if (logfd >= 0) close(logfd);
         return -1;
     }
+    const int pinnedFd = spec.host ? -1 : envNsFd(name);
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -1133,6 +1255,8 @@ pid_t ContainerManager::spawnInContainer(const std::string& name, const SpawnSpe
     }
     if (pid == 0) {
         close(syncPipe[0]);
+        close(readyPipe[0]);
+        close(goPipe[1]);
         setsid();
         setpgid(0, 0);
         // stdout/stderr -> log, stdin -> /dev/null
@@ -1154,27 +1278,26 @@ pid_t ContainerManager::spawnInContainer(const std::string& name, const SpawnSpe
                 struct dirent* fe;
                 while ((fe = readdir(fds)) != nullptr) {
                     int fd = atoi(fe->d_name);
-                    if (fd > STDERR_FILENO && fd != dfd && fd != syncPipe[1]) close(fd);
+                    if (fd > STDERR_FILENO && fd != dfd && fd != syncPipe[1] && fd != readyPipe[1] &&
+                        fd != goPipe[0] && fd != pinnedFd)
+                        close(fd);
                 }
                 closedir(fds);
             }
         }
-        if (!spec.host) {
-            tryUnshareMountNs();
-            if (!setupBindMounts(rootfs)) {
-                const char m = 125;
-                write(syncPipe[1], &m, 1);
-                _exit(125);
-            }
-        }
-        // Host-exec units join the env's cgroup too: stop/KillMode/restart accounting are the same, and the
-        // helper dies with the env.
-        mCgroup_.joinContainerCgroup(name, getpid());
-        mCgroup_.joinCpuset(getpid());
-        if (!spec.host && chroot(rootfs.c_str()) != 0) {
-            const char m = 126;
+        if (spec.host) {
+            // Host-exec units join the env's cgroup too (parentAdmitEnv does it): stop/KillMode/restart
+            // accounting are the same, and the helper dies with the env.
+            const char what = 'H';
+            write(readyPipe[1], &what, 1);
+            close(readyPipe[1]);
+            char go = 0;
+            TEMP_FAILURE_RETRY(read(goPipe[0], &go, 1));
+            close(goPipe[0]);
+        } else if (!childEnterEnv(rootfs, pinnedFd, readyPipe[1], goPipe[0])) {
+            const char m = 125;
             write(syncPipe[1], &m, 1);
-            _exit(126);
+            _exit(125);
         }
         if (chdir(spec.workDir.c_str()) != 0) {
             if (!spec.workDirOptional) {
@@ -1191,7 +1314,10 @@ pid_t ContainerManager::spawnInContainer(const std::string& name, const SpawnSpe
         _exit(127);
     }
     close(syncPipe[1]);
+    close(readyPipe[1]);
+    close(goPipe[0]);
     if (logfd >= 0) close(logfd);
+    parentAdmitEnv(name, pid, readyPipe[0], goPipe[1]);
     // The pipe closes at exec (O_CLOEXEC) -> read returns 0 on success, or a failure code byte.
     char code = 0;
     ssize_t n = read(syncPipe[0], &code, 1);
@@ -1202,8 +1328,7 @@ pid_t ContainerManager::spawnInContainer(const std::string& name, const SpawnSpe
         if (err) {
             switch (code) {
                 case 124: *err = "WorkingDirectory " + spec.workDir + " missing"; break;
-                case 125: *err = "setupBindMounts failed"; break;
-                case 126: *err = "chroot failed"; break;
+                case 125: *err = "entering the env (mount namespace, binds, root) failed"; break;
                 default: *err = "exec " + spec.argv[0] + " failed"; break;
             }
         }
