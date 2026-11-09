@@ -563,6 +563,26 @@ bool ContainerManager::resetContainer(const std::string& name) {
 // no LSM remount hook, so no labeledfs:filesystem remount grant is needed (MS_REMOUNT would);
 // the self-bind needs aohp_container_data_file:dir mounton, which the policy already has.
 // Best effort: if either step fails the env runs as before, just without setuid.
+// Enter the rootfs with pivot_root(2), chroot(2) as the fallback. A pivoted root is the mount
+// namespace's root, so the kernel's "chrooted" checks pass: create_user_ns() refuses a chrooted
+// caller, which is why unshare(CLONE_NEWUSER) failed EPERM in every env (2026-11-09). Needs the
+// rootfs to be a mount point, which allowSetuidInRootfs()' self-bind provides. pivot_root(".", ".")
+// stacks the old root on top of the new one; the lazy unmount drops it (runc does the same).
+static bool enterRootfs(const std::string& rootfs) {
+    if (chdir(rootfs.c_str()) == 0 && syscall(__NR_pivot_root, ".", ".") == 0) {
+        if (umount2(".", MNT_DETACH) != 0) PLOG(WARNING) << "detach old root after pivot_root";
+        if (chdir("/") != 0) PLOG(WARNING) << "chdir / after pivot_root";
+        return true;
+    }
+    PLOG(WARNING) << "pivot_root " << rootfs << " failed; falling back to chroot";
+    if (chroot(rootfs.c_str()) != 0) {
+        PLOG(ERROR) << "chroot " << rootfs;
+        return false;
+    }
+    if (chdir("/") != 0) PLOG(WARNING) << "chdir / after chroot";
+    return true;
+}
+
 static void allowSetuidInRootfs(const std::string& rootfs) {
     if (mount(rootfs.c_str(), rootfs.c_str(), nullptr, MS_BIND, nullptr) != 0) {
         PLOG(WARNING) << "self-bind " << rootfs << " (for setuid) failed";
@@ -605,6 +625,31 @@ bool ContainerManager::setupBindMounts(const std::string& rootfs) {
     }
     if (!doMount("/dev", "/dev", 0)) return false;
     if (!doMount("/sys", "/sys", MS_RDONLY)) return false;
+
+    // cgroup v2 for OCI runtimes in the env (podman/crun, 2026-11-09). The /sys bind above is
+    // non-recursive, so /sys/fs/cgroup is an empty sysfs directory and crun refuses it ("invalid
+    // file system type"). Mount a cgroup2 instance over it: the host-wide hierarchy for now, so a
+    // runtime's containers land in /libpod_parent next to this env's own group, with memory/pids
+    // delegated from the root at daemon start (CgroupController::loadConfig). A per-env cgroup
+    // namespace needs an anchor the daemon keeps alive; follow-up.
+    {
+        std::string cgt = rootfs + "/sys/fs/cgroup";
+        if (ensureDir(cgt, 0555) &&
+            mount("cgroup2", cgt.c_str(), "cgroup2", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr) != 0) {
+            PLOG(WARNING) << "cgroup2 mount in env failed (OCI runtimes in the env will not start)";
+        }
+    }
+    // POSIX message queues: glibc's mq_open() needs /dev/mqueue (aohp-containerd.rc creates the
+    // directory on the host /dev that is bound above); one mqueue instance per ipc namespace.
+    {
+        std::string mq = rootfs + "/dev/mqueue";
+        struct stat mqst;
+        if (stat(mq.c_str(), &mqst) == 0 && S_ISDIR(mqst.st_mode)) {
+            if (mount("mqueue", mq.c_str(), "mqueue", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr) != 0) {
+                PLOG(WARNING) << "mqueue mount on /dev/mqueue failed (POSIX mq in env will not work)";
+            }
+        }
+    }
 
     std::string devpts = rootfs + "/dev/pts";
     if (!ensureDir(devpts, 0755)) return false;
@@ -704,11 +749,9 @@ int ContainerManager::forkIntoContainer(const std::string& containerName, const 
         mCgroup_.joinContainerCgroup(containerName, getpid());
         mCgroup_.joinCpuset(getpid());
 
-        if (chroot(rootfs.c_str()) != 0) {
-            PLOG(ERROR) << "chroot " << rootfs;
+        if (!enterRootfs(rootfs)) {
             _exit(126);
         }
-        chdir("/");
 
         setContainerChildCommonEnv();
 
@@ -776,10 +819,9 @@ ExecResult ContainerManager::execSync(const std::string& name, const std::string
         mCgroup_.joinContainerCgroup(name, getpid());
         mCgroup_.joinCpuset(getpid());
 
-        if (chroot(rootfs.c_str()) != 0) {
+        if (!enterRootfs(rootfs)) {
             _exit(126);
         }
-        chdir("/");
 
         setContainerChildCommonEnv();
 

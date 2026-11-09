@@ -117,6 +117,12 @@ void CgroupController::loadConfig(const char* path) {
 
     mEnabled_ = true;
     LOG(INFO) << "cgroup v2 enabled memory.max=" << mMemoryMax << " cpu.max=" << mCpuMax;
+    // Delegate memory and pids below the root (Android enables only memory): per-env pids.max and
+    // the groups an OCI runtime creates from inside an env need them. The root is exempt from the
+    // no-internal-process rule, so this is always allowed; best effort otherwise.
+    if (!writeFile(mCgroupRoot_ + "/cgroup.subtree_control", "+memory +pids\n")) {
+        LOG(WARNING) << "could not enable +memory +pids on the root cgroup (pids limits unavailable)";
+    }
 }
 
 bool CgroupController::parseSizeToString(const std::string& in, std::string* outBytes) {
@@ -183,11 +189,13 @@ bool CgroupController::createForContainer(const std::string& containerName) {
     std::string err;
     if (!writeFile(cg + "/memory.max", mMemoryMax + "\n")) err += "memory.max;";
     if (!writeFile(cg + "/memory.swap.max", mMemorySwapMax + "\n")) err += "memory.swap.max;";
-    if (!writeFile(cg + "/cpu.max", mCpuMax + "\n")) err += "cpu.max;";
-    if (!writeFile(cg + "/pids.max", mPidsMax + "\n")) err += "pids.max;";
+    // cpu is a v1 hierarchy (/dev/cpuctl) on Android and pids depends on root delegation: a
+    // missing knob is logged, not fatal, so the env still joins its group and gets memory limits.
+    struct stat kst;
+    if (stat((cg + "/cpu.max").c_str(), &kst) == 0 && !writeFile(cg + "/cpu.max", mCpuMax + "\n")) err += "cpu.max;";
+    if (stat((cg + "/pids.max").c_str(), &kst) == 0 && !writeFile(cg + "/pids.max", mPidsMax + "\n")) err += "pids.max;";
     if (!err.empty()) {
-        LOG(ERROR) << "cgroup write partial fail: " << err;
-        return false;
+        LOG(WARNING) << "cgroup write partial fail (continuing): " << err;
     }
     return true;
 }
