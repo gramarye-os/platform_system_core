@@ -7,6 +7,7 @@
 
 #define LOG_TAG "aohp-containerd"
 
+#include "bridge_net.h"
 #include "container_manager.h"
 #include "protocol.h"
 #include "session.h"
@@ -303,18 +304,29 @@ int main(int argc, char** argv) {
     // command parsed as several requests) must not kill the daemon - and with it every env.
     signal(SIGPIPE, SIG_IGN);
     std::string clientLine, sockPath = "/dev/socket/aohp_container", bindPath;
+    bool bridgeNetOnly = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--client" && i + 1 < argc) clientLine = argv[++i];
+        else if (a == "--bridge-net-only") bridgeNetOnly = true;
         else if (a == "--socket" && i + 1 < argc) sockPath = argv[++i];
         else if (a == "--bind" && i + 1 < argc) bindPath = argv[++i];
         else if (a == "--help" || a == "-h") {
             fputs("usage: aohp-containerd [--bind PATH]            (daemon; init passes the socket)\n"
-                  "       aohp-containerd --client LINE [--socket PATH]\n", stdout);
+                  "       aohp-containerd --client LINE [--socket PATH]\n"
+                  "       aohp-containerd --bridge-net-only          (debug: only the bridge/netd plumbing)\n", stdout);
             return 0;
         }
     }
     if (!clientLine.empty()) return runClient(clientLine, sockPath);
+    if (bridgeNetOnly) {
+        // Debug aid: run the netd plumbing for container bridges beside a live daemon (which must
+        // not have it, or the two fight over netd); no envs, no units, no control socket.
+        android::base::InitLogging(argv, android::base::StderrLogger);
+        BridgeNetManager bn;
+        if (!bn.start()) return 1;
+        for (;;) pause();
+    }
 
     android::base::InitLogging(argv, android::base::LogdLogger(android::base::SYSTEM));
     LOG(INFO) << "aohp-containerd starting";
@@ -329,6 +341,10 @@ int main(int argc, char** argv) {
     gMgr.adoptOrphanServicePids();
 
     gMgr.units().start();
+
+    // Container bridges created in an env (podman0 & co.) need netd plumbing to reach anything.
+    static BridgeNetManager gBridgeNet;
+    if (!gBridgeNet.start()) LOG(WARNING) << "bridge network plumbing disabled (netlink monitor failed)";
 
     int serverFd = android_get_control_socket("aohp_container");
     if (serverFd < 0 && !bindPath.empty()) {

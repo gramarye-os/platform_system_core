@@ -6,6 +6,7 @@ cc_binary {
     name: "aohp-containerd",
     srcs: [
         "main.cpp",
+        "bridge_net.cpp",
         "container_manager.cpp",
         "cgroup_controller.cpp",
         "session.cpp",

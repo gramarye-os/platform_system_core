@@ -14,6 +14,8 @@ enum LogSeverity { VERBOSE, DEBUG, INFO, WARNING, ERROR, FATAL_WITHOUT_ABORT, FA
 enum LogId { MAIN, SYSTEM };
 struct LogdLogger { explicit LogdLogger(LogId = MAIN) {} };
 inline void InitLogging(char**, LogdLogger = LogdLogger()) {}
+inline void StderrLogger(LogId, int, const char*, const char*, unsigned int, const char*) {}
+template <typename F> inline void InitLogging(char**, F) {}
 
 class LogMessage {
 public:

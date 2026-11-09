@@ -20,6 +20,7 @@
 #include <sstream>
 
 #include <algorithm>
+#include <tuple>
 #include <vector>
 
 #include <dirent.h>
@@ -585,6 +586,73 @@ static bool enterRootfs(const std::string& rootfs) {
     return true;
 }
 
+
+// Record the directory tree (and symlinks) of <rootfs>/run before covering it, then rebuild it on
+// the tmpfs with the same modes and owners. Regular files, sockets and fifos are runtime state and
+// stay behind. Depth-limited: the persistent /run only ever holds a shallow skeleton.
+static void collectRunSkeleton(const std::string& base, const std::string& rel, int depth,
+                               std::vector<std::tuple<std::string, mode_t, uid_t, gid_t, std::string>>* out) {
+    if (depth > 4) return;
+    DIR* d = opendir((base + rel).c_str());
+    if (!d) return;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        std::string n = e->d_name;
+        if (n == "." || n == "..") continue;
+        std::string r = rel + "/" + n;
+        struct stat st;
+        if (lstat((base + r).c_str(), &st) != 0) continue;
+        if (S_ISLNK(st.st_mode)) {
+            char buf[PATH_MAX];
+            ssize_t len = readlink((base + r).c_str(), buf, sizeof(buf) - 1);
+            if (len > 0) out->emplace_back(r, st.st_mode, st.st_uid, st.st_gid, std::string(buf, len));
+        } else if (S_ISDIR(st.st_mode)) {
+            // Skip trees that belong to the runtimes themselves: they are exactly what must be
+            // empty after a reboot.
+            if (rel.empty() && (n == "containers" || n == "libpod" || n == "crun" || n == "netns" ||
+                                n == "runc" || n == "user"))
+                continue;
+            out->emplace_back(r, st.st_mode, st.st_uid, st.st_gid, "");
+            collectRunSkeleton(base, r, depth + 1, out);
+        }
+    }
+    closedir(d);
+}
+
+static void mountRunTmpfs(const std::string& rootfs) {
+    std::string run = rootfs + "/run";
+    struct stat st;
+    if (stat(run.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) return;
+    std::vector<std::tuple<std::string, mode_t, uid_t, gid_t, std::string>> skel;
+    collectRunSkeleton(run, "", 0, &skel);
+    if (mount("tmpfs", run.c_str(), "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755,size=10%") != 0) {
+        PLOG(WARNING) << "tmpfs mount on /run failed (runtime state persists across reboots)";
+        return;
+    }
+    for (const auto& ent : skel) {
+        const std::string path = run + std::get<0>(ent);
+        if (!std::get<4>(ent).empty()) {
+            if (symlink(std::get<4>(ent).c_str(), path.c_str()) != 0 && errno != EEXIST)
+                PLOG(WARNING) << "run skeleton symlink " << path;
+            continue;
+        }
+        if (mkdir(path.c_str(), std::get<1>(ent) & 07777) != 0 && errno != EEXIST) {
+            PLOG(WARNING) << "run skeleton mkdir " << path;
+            continue;
+        }
+        chmod(path.c_str(), std::get<1>(ent) & 07777);
+        if (std::get<2>(ent) != 0 || std::get<3>(ent) != 0) {
+            if (lchown(path.c_str(), std::get<2>(ent), std::get<3>(ent)) != 0) PLOG(WARNING) << "run skeleton chown " << path;
+        }
+    }
+    // /run/user/0 is XDG_RUNTIME_DIR for the env's root session (Wayland, dbus session, pipewire).
+    mkdir((run + "/user").c_str(), 0755);
+    mkdir((run + "/user/0").c_str(), 0700);
+    // /run/lock is 1777 on Debian.
+    mkdir((run + "/lock").c_str(), 01777);
+    chmod((run + "/lock").c_str(), 01777);
+}
+
 static void allowSetuidInRootfs(const std::string& rootfs) {
     if (mount(rootfs.c_str(), rootfs.c_str(), nullptr, MS_BIND, nullptr) != 0) {
         PLOG(WARNING) << "self-bind " << rootfs << " (for setuid) failed";
@@ -673,6 +741,14 @@ bool ContainerManager::setupBindMounts(const std::string& rootfs) {
     } else {
         LOG(WARNING) << "no /dev/shm on the host (aohp-containerd.rc should create it); POSIX shm unavailable";
     }
+
+    // /run is a tmpfs on every Linux distribution: runtime state that must not outlive a boot. The
+    // env's persistent /run made podman refuse to start after a phone reboot ("boot ID differs from
+    // cached boot ID", /run/libpod and /run/containers/storage) and left stale pid/lock files for
+    // sshd, dbus, tailscaled. Mount a tmpfs there (the mount namespace is now per env, so it lives
+    // as long as the env is up) and recreate the directory skeleton underneath - Debian's
+    // tmpfiles.d equivalent; the units already mkdir their own runtime dirs on start.
+    mountRunTmpfs(rootfs);
 
     struct stat st;
     if (stat("/sdcard", &st) == 0) {
