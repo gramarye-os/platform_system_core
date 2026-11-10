@@ -122,10 +122,15 @@ void CgroupController::loadConfig(const char* path) {
     LOG(INFO) << "cgroup v2 enabled memory.max=" << mMemoryMax << " cpu.max=" << mCpuMax;
     // Delegate memory and pids below the root (Android enables only memory): per-env pids.max and
     // the groups an OCI runtime creates from inside an env need them. The root is exempt from the
-    // no-internal-process rule, so this is always allowed; best effort otherwise.
-    if (!writeFile(mCgroupRoot_ + "/cgroup.subtree_control", "+memory +pids\n")) {
-        LOG(WARNING) << "could not enable +memory +pids on the root cgroup (pids limits unavailable)";
+    // no-internal-process rule, so this is always allowed. One controller per write: a combined
+    // "+memory +pids" is rejected as a whole when one of them is missing, and the Pixel 6 boots with
+    // cgroup_disable=memory - that left pids undelegated and crun refused every container
+    // ("controller pids is not available", 2026-11-09).
+    std::string delegated;
+    for (const char* c : {"memory", "pids"}) {
+        if (writeFile(mCgroupRoot_ + "/cgroup.subtree_control", std::string("+") + c + "\n")) delegated += std::string(c) + " ";
     }
+    LOG(INFO) << "root cgroup delegates [" << delegated << "]";
 }
 
 bool CgroupController::parseSizeToString(const std::string& in, std::string* outBytes) {
