@@ -28,7 +28,9 @@ service aohp-containerd /system/bin/aohp-containerd
     # (sepolicy grants the matching self:capability audit_write + netlink_audit_socket).
     # MKNOD/SETPCAP/SETFCAP/SYS_RESOURCE: OCI runtimes in the env (crun creates device nodes,
     # drops capabilities for the container, sets file caps, raises rlimits)
-    capabilities SYS_CHROOT SYS_ADMIN SYS_PTRACE SETUID SETGID DAC_OVERRIDE KILL FOWNER CHOWN FSETID NET_ADMIN NET_RAW AUDIT_WRITE MKNOD SETPCAP SETFCAP SYS_RESOURCE
+    # NET_BIND_SERVICE: ports below 1024 for services in the env (aardvark-dns :53 for container
+    # name resolution, sshd :22, web servers) - without it podman needs dns_bind_port=1053.
+    capabilities SYS_CHROOT SYS_ADMIN SYS_PTRACE SETUID SETGID DAC_OVERRIDE KILL FOWNER CHOWN FSETID NET_ADMIN NET_RAW NET_BIND_SERVICE AUDIT_WRITE MKNOD SETPCAP SETFCAP SYS_RESOURCE
     socket aohp_container stream 0660 system system
     seclabel u:r:aohp_container_daemon:s0
     writepid /dev/cpuset/system-background/tasks
