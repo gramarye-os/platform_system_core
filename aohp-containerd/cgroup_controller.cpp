@@ -16,9 +16,12 @@
 #include <fstream>
 #include <sstream>
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include <vector>
 
 #include <android-base/logging.h>
 #include <android-base/strings.h>
@@ -197,12 +200,50 @@ bool CgroupController::createForContainer(const std::string& containerName) {
     if (!err.empty()) {
         LOG(WARNING) << "cgroup write partial fail (continuing): " << err;
     }
+    std::string leaf = leafPathFor(containerName);
+    if (mkdir(leaf.c_str(), 0755) != 0 && errno != EEXIST) PLOG(WARNING) << "mkdir " << leaf;
     return true;
+}
+
+std::string CgroupController::leafPathFor(const std::string& containerName) const {
+    return cgroupPathFor(containerName) + "/init";
+}
+
+bool CgroupController::groupHasProcs(const std::string& dir) {
+    std::ifstream in(dir + "/cgroup.procs");
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty()) return true;
+    }
+    return false;
+}
+
+// rmdir every descendant group that holds no process, bottom-up. Groups an OCI runtime left behind
+// (libpod_parent/..., conmon) are what this clears; anything still populated is kept.
+void CgroupController::pruneEmptyChildren(const std::string& dir) {
+    DIR* d = opendir(dir.c_str());
+    if (!d) return;
+    std::vector<std::string> kids;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        if (e->d_name[0] == '.') continue;
+        std::string p = dir + "/" + e->d_name;
+        struct stat st;
+        if (lstat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) kids.push_back(p);
+    }
+    closedir(d);
+    for (const auto& k : kids) {
+        pruneEmptyChildren(k);
+        if (!groupHasProcs(k) && rmdir(k.c_str()) != 0 && errno != ENOENT && errno != EBUSY) {
+            PLOG(WARNING) << "rmdir cgroup " << k;
+        }
+    }
 }
 
 void CgroupController::destroyForContainer(const std::string& containerName) {
     if (!mEnabled_) return;
     std::string cg = cgroupPathFor(containerName);
+    pruneEmptyChildren(cg);
     if (rmdir(cg.c_str()) != 0 && errno != ENOENT) {
         PLOG(WARNING) << "rmdir cgroup " << cg;
     }
@@ -216,13 +257,61 @@ bool CgroupController::joinContainerCgroup(const std::string& containerName, pid
         // createForContainer failed or cgroup not present — run without per-env limits.
         return true;
     }
-    std::string path = cg + "/cgroup.procs";
+    std::string leaf = leafPathFor(containerName);
+    if (mkdir(leaf.c_str(), 0755) != 0 && errno != EEXIST) PLOG(WARNING) << "mkdir " << leaf;
+    std::string path = leaf + "/cgroup.procs";
     std::string s = std::to_string(static_cast<int>(pid)) + "\n";
     if (!writeFile(path, s)) {
-        // Common on devices where root cgroup did not delegate +cpu/+pids to children.
         PLOG(WARNING) << "join cgroup failed " << path;
     }
     return true;
+}
+
+bool CgroupController::placeAtGroupRoot(const std::string& containerName, pid_t pid) {
+    if (!mEnabled_ || !mV2Detected_) return false;
+    std::string cg = cgroupPathFor(containerName);
+    struct stat st;
+    if (stat(cg.c_str(), &st) != 0 && !createForContainer(containerName)) return false;
+    pruneEmptyChildren(cg);
+    std::string enabled = readFileTrim(cg + "/cgroup.subtree_control");
+    if (!enabled.empty()) {
+        // Disabling fails with EBUSY while a child still has the controller enabled for its own
+        // children (a live container tree): then this env keeps running without a namespace.
+        std::istringstream iss(enabled);
+        std::string c;
+        while (iss >> c) {
+            if (!writeFile(cg + "/cgroup.subtree_control", "-" + c + "\n")) {
+                LOG(INFO) << "env " << containerName << ": controllers busy in " << cg << ", no cgroup namespace";
+                return false;
+            }
+        }
+    }
+    if (!writeFile(cg + "/cgroup.procs", std::to_string(static_cast<int>(pid)) + "\n")) {
+        PLOG(WARNING) << "place at group root failed " << cg;
+        return false;
+    }
+    return true;
+}
+
+void CgroupController::enableSubtree(const std::string& containerName) {
+    if (!mEnabled_ || !mV2Detected_) return;
+    std::string cg = cgroupPathFor(containerName);
+    std::istringstream iss(readFileTrim(cg + "/cgroup.controllers"));
+    std::string c, on;
+    while (iss >> c) {
+        if (c != "memory" && c != "pids" && c != "cpu") continue;
+        // One at a time: on a kernel where memory is still a v1 hierarchy only pids is here.
+        if (writeFile(cg + "/cgroup.subtree_control", "+" + c + "\n")) on += c + " ";
+    }
+    LOG(INFO) << "env " << containerName << ": subtree controllers [" << on << "]";
+}
+
+bool CgroupController::killAll(const std::string& containerName) {
+    if (!mEnabled_ || !mV2Detected_) return false;
+    std::string k = cgroupPathFor(containerName) + "/cgroup.kill";
+    struct stat st;
+    if (stat(k.c_str(), &st) != 0) return false;
+    return writeFile(k, "1\n");
 }
 
 static constexpr const char* kPowerModeFile = "/data/aohp/power";
@@ -264,14 +353,28 @@ void CgroupController::joinCpuset(pid_t pid) const {
 
 void CgroupController::applyCpusetToContainer(const std::string& containerName) const {
     if (!mEnabled_ || !mV2Detected_) return;
-    applyCpusetToProcs(cgroupPathFor(containerName) + "/cgroup.procs", containerName);
+    applyCpusetToTree(cgroupPathFor(containerName), containerName);
 }
 
-// Every process the daemon ever spawned - containers, exec sessions, units, HostExec helpers and their
-// orphaned grandchildren - stays in the cgroup v2 group init/libprocessgroup created for the daemon
-// service itself (/proc/self/cgroup "0::/system/uid_0/pid_N"), whether or not the per-env cgroups are
-// usable on this device (they are not on dodge: the root does not delegate). That group is the reliable
-// enumeration for a power-mode switch.
+// Walk an env group: the init leaf plus whatever an OCI runtime created beside it.
+void CgroupController::applyCpusetToTree(const std::string& dir, const std::string& what) const {
+    applyCpusetToProcs(dir + "/cgroup.procs", what);
+    DIR* d = opendir(dir.c_str());
+    if (!d) return;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        if (e->d_name[0] == '.') continue;
+        std::string p = dir + "/" + e->d_name;
+        struct stat st;
+        if (lstat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) applyCpusetToTree(p, what + "/" + e->d_name);
+    }
+    closedir(d);
+}
+
+// Processes the daemon spawned sit either in their env group (aohp-<env>/init and the runtime's
+// groups beside it) or, when that was not possible, in the cgroup v2 group init/libprocessgroup
+// created for the daemon service itself (/proc/self/cgroup "0::/system/uid_0/pid_N"). Both are
+// walked for a power-mode switch.
 void CgroupController::applyCpusetToAll() const {
     std::ifstream self("/proc/self/cgroup");
     std::string line, path;
@@ -280,6 +383,14 @@ void CgroupController::applyCpusetToAll() const {
     }
     if (path.empty()) { LOG(WARNING) << "no cgroup v2 path for self"; return; }
     applyCpusetToProcs("/sys/fs/cgroup" + path + "/cgroup.procs", "daemon group " + path);
+    DIR* d = opendir(mCgroupRoot_.c_str());
+    if (!d) return;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        if (strncmp(e->d_name, "aohp-", 5) != 0) continue;
+        applyCpusetToTree(mCgroupRoot_ + "/" + e->d_name, e->d_name);
+    }
+    closedir(d);
 }
 
 void CgroupController::applyCpusetToProcs(const std::string& procsFile, const std::string& what) const {

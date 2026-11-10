@@ -87,20 +87,24 @@ private:
     CgroupController mCgroup_;
     std::unique_ptr<UnitManager> mUnits_;
 
-    // One mount namespace per env (see "per-env mount namespace" in container_manager.cpp): an nsfs
-    // fd pinning /proc/<first child>/ns/mnt, absent until an entry has built it.
+    // Per-env namespaces (see "per-env mount namespace" in container_manager.cpp): nsfs fds pinning
+    // /proc/<first child>/ns/{mnt,cgroup}, absent until an entry has built them.
+    struct EnvNs {
+        int mnt = -1;  // mount namespace
+        int cg = -1;   // cgroup namespace rooted at the env group, -1 when the env runs without one
+    };
     std::mutex mEnvNsMutex_;
-    std::map<std::string, int> mEnvNsFd_;
-    int envNsFd(const std::string& name);
-    void pinEnvNs(const std::string& name, pid_t pid);
+    std::map<std::string, EnvNs> mEnvNs_;
+    EnvNs envNs(const std::string& name);
+    void pinEnvNs(const std::string& name, pid_t pid, bool withCgroupNs);
     void dropEnvNs(const std::string& name);
     void repinEnvNsFromPid(const std::string& name, pid_t pid);
     // Child side of an env entry: join the pinned namespace or build a new one, report on readyFd,
     // wait for the parent's go byte. Parent side: read the report, put the child in the env cgroup,
     // pin the namespace when it is new, send go. Together they replace the unshare / binds / cgroup /
     // pivot sequence each entry point used to run by itself.
-    bool childEnterEnv(const std::string& rootfs, int pinnedFd, int readyFd, int goFd);
-    void parentAdmitEnv(const std::string& name, pid_t pid, int readyFd, int goFd);
+    bool childEnterEnv(const std::string& rootfs, const EnvNs& pinned, int readyFd, int goFd);
+    void parentAdmitEnv(const std::string& name, pid_t pid, int readyFd, int goFd, bool firstEntry);
 
     std::string rootfsPath(const std::string& name);
     std::string envPath(const std::string& name);

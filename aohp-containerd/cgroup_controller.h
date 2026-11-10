@@ -29,8 +29,32 @@ public:
     /** Remove cgroup directory (processes must already be gone). */
     void destroyForContainer(const std::string& containerName);
 
-    /** Best-effort: move pid into this container's cgroup before chroot (logs on failure; always ok to continue). */
+    /**
+     * Best-effort: move pid into the env's leaf group (<env group>/init). Every process the daemon
+     * puts in an env lives there; the env group itself stays process-free so controllers can be
+     * enabled for the children an OCI runtime creates beside the leaf (cgroup v2 no-internal-process
+     * rule). Logs on failure; always ok to continue.
+     */
     bool joinContainerCgroup(const std::string& containerName, pid_t pid);
+
+    /** <env group>/init, the leaf the env's own processes live in. */
+    std::string leafPathFor(const std::string& containerName) const;
+
+    /**
+     * First entry of an env that gets its own cgroup namespace: unshare(CLONE_NEWCGROUP) makes the
+     * caller's current group the namespace root, and that has to be the env group, not the leaf, so
+     * the runtime's groups land beside the leaf. A process may only be written into a group whose
+     * subtree_control is empty, so this prunes empty descendant groups, clears the controllers and
+     * moves pid into the env group. False when a live tree (containers from before a daemon
+     * restart) makes that impossible; the caller then joins the leaf without a namespace.
+     */
+    bool placeAtGroupRoot(const std::string& containerName, pid_t pid);
+
+    /** Enable the delegated controllers (memory, pids, and cpu where it exists) for the env group's children. */
+    void enableSubtree(const std::string& containerName);
+
+    /** Kill every process in the env tree with cgroup.kill (5.14+). False when the knob is missing. */
+    bool killAll(const std::string& containerName);
 
     /** JSON: memoryCurrent, memoryMax, memoryPeak, cpuUsageUsec, pidsCurrent, cgroupPath */
     std::string getUsageJson(const std::string& containerName) const;
@@ -71,6 +95,9 @@ private:
     std::string mPidsMax;
     PowerMode mPowerMode_ = PowerMode::kPerformance;
     void applyCpusetToProcs(const std::string& procsFile, const std::string& what) const;
+    void applyCpusetToTree(const std::string& dir, const std::string& what) const;
+    static bool groupHasProcs(const std::string& dir);
+    static void pruneEmptyChildren(const std::string& dir);
     static const char* cpusetFor(PowerMode m) { return m == PowerMode::kSaver ? "/dev/cpuset/system-background/tasks" : "/dev/cpuset/top-app/tasks"; }
 
     static std::string sanitizeName(const std::string& name);
