@@ -20,6 +20,7 @@
 #include <sstream>
 
 #include <algorithm>
+#include <set>
 #include <tuple>
 #include <vector>
 
@@ -279,6 +280,185 @@ bool ContainerManager::extractTemplate(const std::string& templateTarGz, const s
     return true;
 }
 
+
+// ---- overlay envs ----------------------------------------------------------------------------------
+// An env used to be a full copy of its template: "aohp env create" inflated the tarball into
+// envs/<name>/rootfs, so two envs meant two Debians on disk and two copies of every library in the
+// page cache. Now the template is extracted once into a read-only lower directory under
+// /data/aohp/templates (one per tarball version, keyed by a stamp of the tarball), and an env is
+// upper/ + work/ with an overlayfs mounted at envs/<name>/rootfs on top of the shared lower. The
+// mount lives in the daemon's (= init's) mount namespace so host-side paths into the rootfs keep
+// working and it survives daemon restarts; the first env entry rbinds it like any directory. Envs
+// created before this (a populated rootfs/ and no .lower) stay "flat" and keep working unchanged.
+
+static constexpr const char* kLowersDir = "/data/aohp/templates";
+static int removePathRecursive(const std::string& path);
+
+static void finishRootfsSkeleton(const std::string& dir) {
+    mkdir((dir + "/proc").c_str(), 0555);
+    mkdir((dir + "/dev").c_str(), 0755);
+    mkdir((dir + "/dev/pts").c_str(), 0755);
+    mkdir((dir + "/sys").c_str(), 0555);
+    mkdir((dir + "/sdcard").c_str(), 0755);
+    mkdir((dir + "/tmp").c_str(), 01777);
+    std::string resolv = dir + "/etc/resolv.conf";
+    int fd = open(resolv.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        const char* dns = "nameserver 8.8.8.8\nnameserver 8.8.4.4\n";
+        write(fd, dns, strlen(dns));
+        close(fd);
+    }
+}
+
+std::string ContainerManager::lowerRecordPath(const std::string& name) {
+    return envPath(name) + "/.lower";
+}
+
+std::string ContainerManager::readLowerRecord(const std::string& name) {
+    std::ifstream in(lowerRecordPath(name).c_str());
+    std::string line;
+    if (!in || !std::getline(in, line)) return "";
+    return android::base::Trim(line);
+}
+
+bool ContainerManager::isOverlayEnv(const std::string& name) {
+    struct stat st;
+    return stat(lowerRecordPath(name).c_str(), &st) == 0;
+}
+
+// Lower directory for this template tarball, extracted on first use. The stamp ties the lower to the
+// tarball's identity (size + mtime + name), so a system update that ships a new template gets a new
+// lower while envs created from the old one keep theirs until reset.
+// Lower path for the template tarball as it is right now ("" when the tarball is missing).
+std::string ContainerManager::lowerPathFor(const std::string& templateName) {
+    std::string tpl = templatePath(templateName);
+    struct stat st;
+    if (stat(tpl.c_str(), &st) != 0) return "";
+    uint64_t h = 1469598103934665603ULL;
+    auto mix = [&h](uint64_t v) {
+        for (int i = 0; i < 8; i++) { h ^= (v >> (i * 8)) & 0xff; h *= 1099511628211ULL; }
+    };
+    mix(static_cast<uint64_t>(st.st_size));
+    mix(static_cast<uint64_t>(st.st_mtime));
+    for (char c : templateName) mix(static_cast<uint64_t>(static_cast<unsigned char>(c)));
+    char stamp[17];
+    snprintf(stamp, sizeof(stamp), "%08x", static_cast<unsigned>(h & 0xffffffffu));
+    return std::string(kLowersDir) + "/" + templateName + "-" + stamp;
+}
+
+bool ContainerManager::ensureLowerExtracted(const std::string& templateName, std::string* lowerOut) {
+    std::string tpl = templatePath(templateName);
+    std::string lower = lowerPathFor(templateName);
+    struct stat st;
+    if (lower.empty()) {
+        mLastError_ = "template not found: " + tpl;
+        LOG(ERROR) << mLastError_;
+        return false;
+    }
+    std::string done = lower + "/.extracted";
+    if (stat(done.c_str(), &st) == 0) {
+        *lowerOut = lower;
+        return true;
+    }
+    mkdir(kLowersDir, 0755);
+    // A half-extracted lower from an interrupted run is discarded.
+    if (stat(lower.c_str(), &st) == 0) removePathRecursive(lower);
+    if (mkdir(lower.c_str(), 0755) != 0) {
+        mLastError_ = std::string("mkdir ") + lower + ": " + strerror(errno);
+        PLOG(ERROR) << mLastError_;
+        return false;
+    }
+    LOG(INFO) << "extracting template " << templateName << " into " << lower;
+    if (!extractTemplate(tpl, lower)) {
+        removePathRecursive(lower);
+        return false;
+    }
+    finishRootfsSkeleton(lower);
+    int fd = open(done.c_str(), O_WRONLY | O_CREAT, 0644);
+    if (fd >= 0) close(fd);
+    *lowerOut = lower;
+    return true;
+}
+
+static bool isMountPoint(const std::string& path, const char* fstype) {
+    FILE* fp = setmntent("/proc/mounts", "r");
+    if (!fp) return false;
+    bool found = false;
+    struct mntent* e;
+    while ((e = getmntent(fp)) != nullptr) {
+        if (path == e->mnt_dir && (!fstype || fstype == std::string(e->mnt_type))) { found = true; break; }
+    }
+    endmntent(fp);
+    return found;
+}
+
+// Mount (or re-mount after a reboot / daemon restart) the env's overlay at its rootfs. Idempotent.
+bool ContainerManager::mountOverlayEnv(const std::string& name) {
+    std::string lower = readLowerRecord(name);
+    if (lower.empty()) return true;  // flat env: nothing to mount
+    std::string env = envPath(name), rootfs = rootfsPath(name);
+    if (isMountPoint(rootfs, "overlay")) return true;
+    struct stat st;
+    if (stat((lower + "/.extracted").c_str(), &st) != 0) {
+        mLastError_ = "lower missing for " + name + ": " + lower + " (reset the env to re-extract)";
+        LOG(ERROR) << mLastError_;
+        return false;
+    }
+    mkdir(rootfs.c_str(), 0755);
+    mkdir((env + "/upper").c_str(), 0755);
+    mkdir((env + "/work").c_str(), 0755);
+    std::string opts = "lowerdir=" + lower + ",upperdir=" + env + "/upper,workdir=" + env + "/work";
+    // No nosuid: /data is nosuid and the env needs setuid binaries (sudo, su, newuidmap).
+    if (mount("overlay", rootfs.c_str(), "overlay", 0, opts.c_str()) != 0) {
+        mLastError_ = std::string("overlay mount for ") + name + ": " + strerror(errno);
+        PLOG(ERROR) << mLastError_;
+        return false;
+    }
+    LOG(INFO) << "env " << name << ": overlay mounted on " << lower;
+    return true;
+}
+
+bool ContainerManager::ensureEnvMounted(const std::string& name) {
+    if (!isOverlayEnv(name)) return true;
+    return mountOverlayEnv(name);
+}
+
+// Remove lowers that no env references and that no longer match a shipped template tarball (after
+// destroy/reset). The current lower of every shipped template is kept even when unreferenced, so
+// destroying the last env of a template does not cost a re-extraction on the next create.
+void ContainerManager::gcUnusedLowers() {
+    std::set<std::string> used;
+    for (const auto& n : listContainers()) {
+        std::string l = readLowerRecord(n);
+        if (!l.empty()) used.insert(l);
+    }
+    if (DIR* td = opendir(TEMPLATE_DIR)) {
+        struct dirent* e;
+        while ((e = readdir(td)) != nullptr) {
+            std::string fn(e->d_name);
+            if (fn.size() > 7 && fn.substr(fn.size() - 7) == ".tar.gz") {
+                std::string cur = lowerPathFor(fn.substr(0, fn.size() - 7));
+                if (!cur.empty()) used.insert(cur);
+            }
+        }
+        closedir(td);
+    }
+    DIR* dir = opendir(kLowersDir);
+    if (!dir) return;
+    struct dirent* e;
+    std::vector<std::string> gone;
+    while ((e = readdir(dir)) != nullptr) {
+        if (e->d_name[0] == '.') continue;
+        std::string p = std::string(kLowersDir) + "/" + e->d_name;
+        if (!used.count(p)) gone.push_back(p);
+    }
+    closedir(dir);
+    for (const auto& p : gone) {
+        LOG(INFO) << "removing unreferenced template lower " << p;
+        removePathRecursive(p);
+    }
+}
+
 bool ContainerManager::createContainer(const std::string& name, const std::string& templateName) {
     mLastError_.clear();
     std::string env = envPath(name);
@@ -291,40 +471,31 @@ bool ContainerManager::createContainer(const std::string& name, const std::strin
         return false;
     }
 
+    std::string lower;
+    if (!ensureLowerExtracted(templateName, &lower)) return false;
+
     if (mkdir(env.c_str(), 0755) != 0 && errno != EEXIST) {
         mLastError_ = std::string("mkdir ") + env + ": " + strerror(errno);
         PLOG(ERROR) << mLastError_;
         return false;
     }
-
-    std::string tpl = templatePath(templateName);
-    if (stat(tpl.c_str(), &st) != 0) {
-        mLastError_ = "template not found: " + tpl;
-        LOG(ERROR) << mLastError_;
-        return false;
-    }
-
-    if (!extractTemplate(tpl, rootfs)) {
-        return false;
-    }
-
-    mkdir((rootfs + "/proc").c_str(), 0555);
-    mkdir((rootfs + "/dev").c_str(), 0755);
-    mkdir((rootfs + "/dev/pts").c_str(), 0755);
-    mkdir((rootfs + "/sys").c_str(), 0555);
-    mkdir((rootfs + "/sdcard").c_str(), 0755);
-    mkdir((rootfs + "/tmp").c_str(), 01777);
-
-    std::string resolv = rootfs + "/etc/resolv.conf";
-    int fd = open(resolv.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) {
-        const char* dns = "nameserver 8.8.8.8\nnameserver 8.8.4.4\n";
-        write(fd, dns, strlen(dns));
+    {
+        int fd = open(lowerRecordPath(name).c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            mLastError_ = "failed to write .lower record";
+            PLOG(ERROR) << mLastError_;
+            return false;
+        }
+        write(fd, lower.data(), lower.size());
+        write(fd, "\n", 1);
         close(fd);
     }
-
     if (!writeTemplateRecord(name, templateName)) {
         mLastError_ = "failed to write .template record";
+        return false;
+    }
+    if (!mountOverlayEnv(name)) {
+        removePathRecursive(env);
         return false;
     }
 
@@ -334,7 +505,7 @@ bool ContainerManager::createContainer(const std::string& name, const std::strin
     mUnits_->forgetEnv(name);
     mUnits_->writeEnvName(name);
 
-    LOG(INFO) << "Container " << name << " created from template " << templateName;
+    LOG(INFO) << "Container " << name << " created from template " << templateName << " (overlay on " << lower << ")";
     return true;
 }
 
@@ -491,6 +662,7 @@ bool ContainerManager::destroyContainer(const std::string& name) {
         LOG(ERROR) << mLastError_;
         return false;
     }
+    gcUnusedLowers();
     LOG(INFO) << "Container " << name << " destroyed";
     return true;
 }
@@ -509,46 +681,49 @@ bool ContainerManager::resetContainer(const std::string& name) {
     killContainerProcesses(rootfs);
     teardownBindMounts(rootfs);
     umountAllUnderRootfs(rootfs);
-    if (recursiveRemove(rootfs) != 0) {
-        LOG(ERROR) << "reset: failed to remove rootfs " << rootfs;
-        return false;
-    }
 
-    std::string tpl;
     std::string recorded = readTemplateRecord(name);
-    if (!recorded.empty()) {
-        tpl = templatePath(recorded);
-        struct stat st;
-        if (stat(tpl.c_str(), &st) != 0) {
-            LOG(WARNING) << "recorded template missing, falling back: " << tpl;
-            tpl.clear();
+    if (isOverlayEnv(name)) {
+        // Overlay env: drop the upper layer and re-mount on the current lower for the template (a
+        // newer template tarball gets a fresh lower; the old one is garbage-collected when unused).
+        if (recursiveRemove(env + "/upper") != 0 || recursiveRemove(env + "/work") != 0) {
+            LOG(ERROR) << "reset: failed to remove upper/work for " << name;
+            return false;
         }
-    }
-    if (tpl.empty()) {
-        tpl = firstTemplateTarInTemplateDir();
-    }
-    if (tpl.empty()) {
-        LOG(ERROR) << "No template found for reset";
-        return false;
-    }
-
-    if (!extractTemplate(tpl, rootfs)) {
-        return false;
-    }
-
-    mkdir((rootfs + "/proc").c_str(), 0555);
-    mkdir((rootfs + "/dev").c_str(), 0755);
-    mkdir((rootfs + "/dev/pts").c_str(), 0755);
-    mkdir((rootfs + "/sys").c_str(), 0555);
-    mkdir((rootfs + "/sdcard").c_str(), 0755);
-    mkdir((rootfs + "/tmp").c_str(), 01777);
-
-    std::string resolv = rootfs + "/etc/resolv.conf";
-    int fd = open(resolv.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) {
-        const char* dns = "nameserver 8.8.8.8\nnameserver 8.8.4.4\n";
-        write(fd, dns, strlen(dns));
-        close(fd);
+        std::string lower;
+        if (recorded.empty() || !ensureLowerExtracted(recorded, &lower)) {
+            LOG(ERROR) << "reset: template for " << name << " unavailable: " << recorded;
+            return false;
+        }
+        int fd = open(lowerRecordPath(name).c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            write(fd, lower.data(), lower.size());
+            write(fd, "\n", 1);
+            close(fd);
+        }
+        if (!mountOverlayEnv(name)) return false;
+        gcUnusedLowers();
+    } else {
+        if (recursiveRemove(rootfs) != 0) {
+            LOG(ERROR) << "reset: failed to remove rootfs " << rootfs;
+            return false;
+        }
+        std::string tpl;
+        if (!recorded.empty()) {
+            tpl = templatePath(recorded);
+            struct stat st;
+            if (stat(tpl.c_str(), &st) != 0) {
+                LOG(WARNING) << "recorded template missing, falling back: " << tpl;
+                tpl.clear();
+            }
+        }
+        if (tpl.empty()) tpl = firstTemplateTarInTemplateDir();
+        if (tpl.empty()) {
+            LOG(ERROR) << "No template found for reset";
+            return false;
+        }
+        if (!extractTemplate(tpl, rootfs)) return false;
+        finishRootfsSkeleton(rootfs);
     }
 
     mCgroup_.destroyForContainer(name);
@@ -948,6 +1123,7 @@ void ContainerManager::parentAdmitEnv(const std::string& name, pid_t pid, int re
 
 int ContainerManager::forkIntoContainer(const std::string& containerName, const std::string& rootfs,
                                        const char* const argv[], bool usePty) {
+    if (!ensureEnvMounted(containerName)) return -1;
     int masterFd = -1;
     int pipeFds[2] = {-1, -1};
 
@@ -1014,6 +1190,9 @@ int ContainerManager::forkIntoContainer(const std::string& containerName, const 
 
 ExecResult ContainerManager::execSync(const std::string& name, const std::string& command,
                                       int timeoutMs) {
+    if (!ensureEnvMounted(name)) {
+        ExecResult r; r.stderrStr = mLastError_; r.exitCode = 125; return r;
+    }
     ExecResult result{-1, "", ""};
     std::string rootfs = rootfsPath(name);
 
@@ -1297,7 +1476,8 @@ std::string ContainerManager::diagnose(const std::string& name) {
     oss << "{\"container\":\"" << jsonEscape(name) << "\",\"template\":\"" << jsonEscape(tpl)
         << "\",\"rootfsExists\":" << (rootfsOk ? "true" : "false") << ",\"npmCacheHostDir\":"
         << (npmHost ? "true" : "false") << ",\"openclawDevHostDir\":" << (devHost ? "true" : "false")
-        << ",\"cgroup\":" << cg << "}";
+        << ",\"layout\":\"" << (isOverlayEnv(name) ? "overlay" : "flat") << "\",\"lower\":\""
+        << jsonEscape(readLowerRecord(name)) << "\",\"cgroup\":" << cg << "}";
     return oss.str();
 }
 
@@ -1306,6 +1486,7 @@ void ContainerManager::adoptOrphanServicePids() {
     for (const auto& name : envs) {
         // Envs created before per-env cgroups existed have none; idempotent for the others.
         mCgroup_.createForContainer(name);
+        if (!ensureEnvMounted(name)) LOG(ERROR) << "env " << name << ": " << mLastError_;
         std::string sdir = servicesDirPath(name);
         DIR* d = opendir(sdir.c_str());
         if (!d) continue;
@@ -1334,6 +1515,10 @@ void ContainerManager::adoptOrphanServicePids() {
 }
 
 pid_t ContainerManager::spawnInContainer(const std::string& name, const SpawnSpec& spec, std::string* err) {
+    if (!spec.host && !ensureEnvMounted(name)) {
+        if (err) *err = mLastError_;
+        return -1;
+    }
     std::string rootfs = rootfsPath(name);
     struct stat st;
     if (stat(rootfs.c_str(), &st) != 0) {

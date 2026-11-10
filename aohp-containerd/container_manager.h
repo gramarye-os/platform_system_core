@@ -87,6 +87,17 @@ private:
     CgroupController mCgroup_;
     std::unique_ptr<UnitManager> mUnits_;
 
+    // Overlay envs (see "overlay envs" in container_manager.cpp): shared read-only template lower
+    // under /data/aohp/templates, per-env upper/work, overlayfs at envs/<name>/rootfs.
+    std::string lowerRecordPath(const std::string& name);
+    std::string readLowerRecord(const std::string& name);
+    bool isOverlayEnv(const std::string& name);
+    std::string lowerPathFor(const std::string& templateName);
+    bool ensureLowerExtracted(const std::string& templateName, std::string* lowerOut);
+    bool mountOverlayEnv(const std::string& name);
+    bool ensureEnvMounted(const std::string& name);
+    void gcUnusedLowers();
+
     // Per-env namespaces (see "per-env mount namespace" in container_manager.cpp): nsfs fds pinning
     // /proc/<first child>/ns/{mnt,cgroup}, absent until an entry has built them.
     struct EnvNs {
