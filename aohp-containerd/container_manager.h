@@ -102,6 +102,7 @@ private:
     // /proc/<first child>/ns/{mnt,cgroup}, absent until an entry has built them.
     struct EnvNs {
         int mnt = -1;  // mount namespace
+        std::string mntId;  // its nsfs link text ("mnt:[<inode>]"): identifies a pid as the env's
         int cg = -1;   // cgroup namespace rooted at the env group, -1 when the env runs without one
     };
     std::mutex mEnvNsMutex_;
@@ -126,7 +127,7 @@ private:
     bool extractTemplate(const std::string& templateTarGz, const std::string& destDir);
     bool setupBindMounts(const std::string& rootfs);
     bool teardownBindMounts(const std::string& rootfs);
-    void killContainerProcesses(const std::string& rootfs);
+    void killContainerProcesses(const std::string& rootfs, const std::string& mntId);
     int forkIntoContainer(const std::string& containerName, const std::string& rootfs,
                           const char* const argv[], bool usePty);
 

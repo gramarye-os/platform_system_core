@@ -566,7 +566,17 @@ static void umountAllUnderRootfs(const std::string& rootfs) {
     }
 }
 
-void ContainerManager::killContainerProcesses(const std::string& rootfs) {
+// Identity of a pid's mount namespace: the nsfs link text, "mnt:[<inode>]". The inode is unique
+// among live namespaces, and an env's namespace stays alive for as long as the daemon pins it.
+static std::string mntNsIdOfPid(const std::string& pid) {
+    char link[64];
+    ssize_t len = readlink(("/proc/" + pid + "/ns/mnt").c_str(), link, sizeof(link) - 1);
+    if (len <= 0) return "";
+    link[len] = '\0';
+    return link;
+}
+
+void ContainerManager::killContainerProcesses(const std::string& rootfs, const std::string& mntId) {
     DIR* proc = opendir("/proc");
     if (!proc) return;
     struct dirent* entry;
@@ -576,6 +586,11 @@ void ContainerManager::killContainerProcesses(const std::string& rootfs) {
         long pid = strtol(entry->d_name, &endp, 10);
         if (*endp != '\0' || pid <= 1) continue;
 
+        // A pivoted env process has root "/" here; its mount namespace identifies it (envOfPid).
+        if (!mntId.empty() && mntNsIdOfPid(entry->d_name) == mntId) {
+            kill(static_cast<pid_t>(pid), SIGKILL);
+            continue;
+        }
         char link[PATH_MAX];
         std::string rootLink = std::string("/proc/") + entry->d_name + "/root";
         ssize_t len = readlink(rootLink.c_str(), link, sizeof(link) - 1);
@@ -589,8 +604,21 @@ void ContainerManager::killContainerProcesses(const std::string& rootfs) {
     usleep(100000);
 }
 
+// Which env does this pid belong to? Env processes enter with pivot_root inside the env's pinned
+// mount namespace, so /proc/<pid>/root reads "/" from here and says nothing (the Driver's
+// credential broker then saw every env caller as uid:0 and denied it, 2026-11-12). The mount
+// namespace is the identity: compare the pid's with each env's pin. A process that left the env's
+// namespace (a container started inside the env) is deliberately not the env. The rootfs-path
+// comparison stays for entries that fell back to chroot.
 std::string ContainerManager::envOfPid(pid_t pid) {
     if (pid <= 1) return "";
+    const std::string mntId = mntNsIdOfPid(std::to_string(pid));
+    if (!mntId.empty()) {
+        std::lock_guard<std::mutex> lock(mEnvNsMutex_);
+        for (const auto& kv : mEnvNs_) {
+            if (kv.second.mntId == mntId) return kv.first;
+        }
+    }
     char link[PATH_MAX];
     std::string rootLink = "/proc/" + std::to_string(pid) + "/root";
     ssize_t len = readlink(rootLink.c_str(), link, sizeof(link) - 1);
@@ -631,6 +659,7 @@ bool ContainerManager::teardownBindMounts(const std::string& rootfs) {
 bool ContainerManager::destroyContainer(const std::string& name) {
     mLastError_.clear();
     mUnits_->forgetEnv(name);
+    const std::string mntId = envNs(name).mntId;  // before the pin goes: killContainerProcesses matches on it
     dropEnvNs(name);
     {
         std::lock_guard<std::mutex> lock(mWorkDirMutex_);
@@ -645,7 +674,7 @@ bool ContainerManager::destroyContainer(const std::string& name) {
             usleep(200000);
         }
         mCgroup_.killAll(name);
-        killContainerProcesses(rootfs);
+        killContainerProcesses(rootfs, mntId);
         teardownBindMounts(rootfs);
         umountAllUnderRootfs(rootfs);
         mCgroup_.destroyForContainer(name);
@@ -669,6 +698,7 @@ bool ContainerManager::destroyContainer(const std::string& name) {
 
 bool ContainerManager::resetContainer(const std::string& name) {
     mUnits_->forgetEnv(name);
+    const std::string mntId = envNs(name).mntId;  // before the pin goes: killContainerProcesses matches on it
     dropEnvNs(name);
     {
         std::lock_guard<std::mutex> lock(mWorkDirMutex_);
@@ -678,7 +708,7 @@ bool ContainerManager::resetContainer(const std::string& name) {
     std::string env = envPath(name);
 
     mCgroup_.killAll(name);
-    killContainerProcesses(rootfs);
+    killContainerProcesses(rootfs, mntId);
     teardownBindMounts(rootfs);
     umountAllUnderRootfs(rootfs);
 
@@ -1001,6 +1031,8 @@ void ContainerManager::pinEnvNs(const std::string& name, pid_t pid, bool withCgr
         PLOG(WARNING) << "env " << name << ": pin mount namespace " << base << "mnt";
         return;
     }
+    ns.mntId = mntNsIdOfPid(std::to_string(pid));
+    if (ns.mntId.empty()) PLOG(WARNING) << "env " << name << ": read mount namespace id " << base << "mnt";
     if (withCgroupNs) {
         ns.cg = open((base + "cgroup").c_str(), O_RDONLY | O_CLOEXEC);
         if (ns.cg < 0) PLOG(WARNING) << "env " << name << ": pin cgroup namespace " << base << "cgroup";
