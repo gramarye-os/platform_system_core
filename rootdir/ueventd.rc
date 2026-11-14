@@ -61,6 +61,11 @@ subsystem vfio
 # udmabuf driver
 /dev/udmabuf              0666   root       root
 
+# AOHP: FUSE, open as on any Linux distribution. SELinux (fuse_device) still decides who may
+# use it. A non-root user in a container needs it for xdg-document-portal: libfuse falls back to
+# the setuid fusermount3 only when mount() is refused, not when the open of /dev/fuse is.
+/dev/fuse                 0666   root       root
+
 # these should not be world writable
 /dev/uhid                 0660   uhid       uhid
 /dev/uinput               0660   uhid       uhid
