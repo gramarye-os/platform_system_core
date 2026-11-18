@@ -48,13 +48,22 @@ namespace aohp {
 namespace {
 
 
+// mkdir that gives a new directory exactly `mode`. The daemon runs with init's umask (077), which
+// takes the group and other bits off whatever mkdir is asked for: an overlay env's root made 0700
+// that way shut every non-root user out of the env. An existing directory is left as it is.
+int mkdirExact(const std::string& path, mode_t mode) {
+    if (mkdir(path.c_str(), mode) != 0) return -1;
+    if (chmod(path.c_str(), mode) != 0) PLOG(WARNING) << "chmod " << path;
+    return 0;
+}
+
 bool mkdirParentsAbsolute(const std::string& path, mode_t mode) {
     if (path.empty() || path[0] != '/') return false;
     size_t pos = 0;
     while ((pos = path.find('/', pos + 1)) != std::string::npos) {
         std::string partial = path.substr(0, pos);
         if (partial.empty()) continue;
-        if (mkdir(partial.c_str(), mode) != 0 && errno != EEXIST) {
+        if (mkdirExact(partial, mode) != 0 && errno != EEXIST) {
             PLOG(ERROR) << "mkdirParentsAbsolute " << partial;
             return false;
         }
@@ -64,7 +73,7 @@ bool mkdirParentsAbsolute(const std::string& path, mode_t mode) {
 
 bool ensureDir(const std::string& path, mode_t mode) {
     if (!mkdirParentsAbsolute(path, mode)) return false;
-    if (mkdir(path.c_str(), mode) != 0 && errno != EEXIST) {
+    if (mkdirExact(path, mode) != 0 && errno != EEXIST) {
         PLOG(ERROR) << "ensureDir mkdir " << path;
         return false;
     }
@@ -295,12 +304,12 @@ static constexpr const char* kLowersDir = "/data/aohp/templates";
 static int removePathRecursive(const std::string& path);
 
 static void finishRootfsSkeleton(const std::string& dir) {
-    mkdir((dir + "/proc").c_str(), 0555);
-    mkdir((dir + "/dev").c_str(), 0755);
-    mkdir((dir + "/dev/pts").c_str(), 0755);
-    mkdir((dir + "/sys").c_str(), 0555);
-    mkdir((dir + "/sdcard").c_str(), 0755);
-    mkdir((dir + "/tmp").c_str(), 01777);
+    mkdirExact(dir + "/proc", 0555);
+    mkdirExact(dir + "/dev", 0755);
+    mkdirExact(dir + "/dev/pts", 0755);
+    mkdirExact(dir + "/sys", 0555);
+    mkdirExact(dir + "/sdcard", 0755);
+    mkdirExact(dir + "/tmp", 01777);
     std::string resolv = dir + "/etc/resolv.conf";
     int fd = open(resolv.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
@@ -360,10 +369,10 @@ bool ContainerManager::ensureLowerExtracted(const std::string& templateName, std
         *lowerOut = lower;
         return true;
     }
-    mkdir(kLowersDir, 0755);
+    mkdirExact(kLowersDir, 0755);
     // A half-extracted lower from an interrupted run is discarded.
     if (stat(lower.c_str(), &st) == 0) removePathRecursive(lower);
-    if (mkdir(lower.c_str(), 0755) != 0) {
+    if (mkdirExact(lower, 0755) != 0) {
         mLastError_ = std::string("mkdir ") + lower + ": " + strerror(errno);
         PLOG(ERROR) << mLastError_;
         return false;
@@ -404,9 +413,10 @@ bool ContainerManager::mountOverlayEnv(const std::string& name) {
         LOG(ERROR) << mLastError_;
         return false;
     }
-    mkdir(rootfs.c_str(), 0755);
-    mkdir((env + "/upper").c_str(), 0755);
-    mkdir((env + "/work").c_str(), 0755);
+    mkdirExact(rootfs, 0755);
+    // The upper dir is what the env sees as its root directory: it has to be 0755.
+    mkdirExact(env + "/upper", 0755);
+    mkdirExact(env + "/work", 0755);
     std::string opts = "lowerdir=" + lower + ",upperdir=" + env + "/upper,workdir=" + env + "/work";
     // No nosuid: /data is nosuid and the env needs setuid binaries (sudo, su, newuidmap).
     if (mount("overlay", rootfs.c_str(), "overlay", 0, opts.c_str()) != 0) {
@@ -474,7 +484,7 @@ bool ContainerManager::createContainer(const std::string& name, const std::strin
     std::string lower;
     if (!ensureLowerExtracted(templateName, &lower)) return false;
 
-    if (mkdir(env.c_str(), 0755) != 0 && errno != EEXIST) {
+    if (mkdirExact(env, 0755) != 0 && errno != EEXIST) {
         mLastError_ = std::string("mkdir ") + env + ": " + strerror(errno);
         PLOG(ERROR) << mLastError_;
         return false;
@@ -853,8 +863,8 @@ static void mountRunTmpfs(const std::string& rootfs) {
         }
     }
     // /run/user/0 is XDG_RUNTIME_DIR for the env's root session (Wayland, dbus session, pipewire).
-    mkdir((run + "/user").c_str(), 0755);
-    mkdir((run + "/user/0").c_str(), 0700);
+    mkdirExact(run + "/user", 0755);
+    mkdirExact(run + "/user/0", 0700);
     // /run/lock is 1777 on Debian.
     mkdir((run + "/lock").c_str(), 01777);
     chmod((run + "/lock").c_str(), 01777);
