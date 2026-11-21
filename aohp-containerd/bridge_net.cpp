@@ -222,6 +222,10 @@ void BridgeNetManager::onAddr(const nlmsghdr* nh, bool gone) {
         if (if_indextoname(ifa->ifa_index, nb)) ifname = nb;
     }
     if (ifname.empty()) return;
+    // Droidspaces does the routing and NAT for its own bridges (ds-br0, ds-<net>) and puts
+    // its rules ahead of netd's. Registering them here as well only adds a second, unused
+    // set of tethering rules for the same bridge.
+    if (ifname.rfind("ds-", 0) == 0) return;
 
     auto it = bridges_.find(ifa->ifa_index);
     if (gone) {
@@ -371,7 +375,8 @@ std::string BridgeNetManager::upstreamIface() {
     // Never treat a bridge or loopback as the uplink (no default network: 8.8.8.8 may resolve
     // to a bridge's connected route through the local table when a container subnet is odd).
     if (result == "lo" || result.rfind("podman", 0) == 0 || result.rfind("docker", 0) == 0 ||
-        result.rfind("cni", 0) == 0 || result.rfind("br-", 0) == 0)
+        result.rfind("cni", 0) == 0 || result.rfind("br-", 0) == 0 ||
+        result.rfind("ds-", 0) == 0)
         result.clear();
     return result;
 }
