@@ -103,6 +103,23 @@ static size_t parseOctalField(const char* field, size_t len) {
     return v;
 }
 
+// Owner or group id of an entry. GNU tar writes an id that does not fit the octal field in base-256 (the first
+// byte then has its high bit set); a rootfs template has no such ids, so one is read as 0.
+static uint32_t parseId(const char* field) {
+    if (static_cast<unsigned char>(field[0]) & 0x80) return 0;
+    return static_cast<uint32_t>(parseOctalField(field, 8));
+}
+
+// Give an entry the owner and group recorded in the tar. There is no user namespace, so the numbers are the
+// container's own (/etc/passwd of the template). Call it before chmod: the kernel clears setuid and setgid
+// when a file changes owner. A failure is not fatal; the entry stays root-owned.
+static void applyOwner(const std::string& path, uint32_t uid, uint32_t gid, int* failures) {
+    if (uid == 0 && gid == 0) return;
+    if (lchown(path.c_str(), uid, gid) != 0) {
+        if ((*failures)++ == 0) PLOG(WARNING) << "lchown " << path << " to " << uid << ":" << gid;
+    }
+}
+
 static bool pathSafe(const std::string& rel) {
     if (rel.empty()) return false;
     if (rel[0] == '/') return false;
@@ -130,6 +147,7 @@ static bool extractUstar(const std::vector<uint8_t>& tar, const std::string& des
                          std::string* error) {
     size_t off = 0;
     std::string longName;
+    int chownFailures = 0;
 
     while (off + 512 <= tar.size()) {
         const uint8_t* h = tar.data() + off;
@@ -176,6 +194,8 @@ static bool extractUstar(const std::vector<uint8_t>& tar, const std::string& des
 
         size_t size = parseOctalField(hdr + 124, 12);
         mode_t mode = static_cast<mode_t>(parseOctalField(hdr + 100, 8)) & 07777;
+        uint32_t uid = parseId(hdr + 108);
+        uint32_t gid = parseId(hdr + 116);
 
         off += 512;
         if (off + round512(size) > tar.size() && size > 0) {
@@ -215,6 +235,7 @@ static bool extractUstar(const std::vector<uint8_t>& tar, const std::string& des
                 left -= static_cast<size_t>(w);
             }
             close(fd);
+            applyOwner(full, uid, gid, &chownFailures);
             if (mode != 0) {
                 chmod(full.c_str(), mode);
             }
@@ -227,6 +248,7 @@ static bool extractUstar(const std::vector<uint8_t>& tar, const std::string& des
                 setErr(error, std::string("mkdir ") + full + ": " + strerror(errno));
                 return false;
             }
+            applyOwner(full, uid, gid, &chownFailures);
             if (mode != 0) {
                 chmod(full.c_str(), mode);
             }
@@ -256,6 +278,7 @@ static bool extractUstar(const std::vector<uint8_t>& tar, const std::string& des
                               strerror(errno));
                 return false;
             }
+            applyOwner(full, uid, gid, &chownFailures);
         } else {
             LOG(WARNING) << "skipping tar entry type " << typeflag << " " << name;
         }
@@ -263,6 +286,9 @@ static bool extractUstar(const std::vector<uint8_t>& tar, const std::string& des
         off += round512(size);
     }
 
+    if (chownFailures > 0) {
+        LOG(WARNING) << chownFailures << " tar entries could not be given their owner and stay root-owned";
+    }
     return true;
 }
 

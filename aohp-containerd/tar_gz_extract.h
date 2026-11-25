@@ -14,6 +14,7 @@ namespace aohp {
 /**
  * Extract a gzip-compressed POSIX ustar tar (Alpine minirootfs format) into destDir.
  * Does not execute /system/bin/tar (toybox probes /vendor and violates coredomain policy).
+ * Each entry gets the numeric owner and group recorded in the tar, then its mode.
  *
  * @param error optional; set on failure
  * @return true on success
