@@ -99,11 +99,12 @@ private:
     void gcUnusedLowers();
 
     // Per-env namespaces (see "per-env mount namespace" in container_manager.cpp): nsfs fds pinning
-    // /proc/<first child>/ns/{mnt,cgroup}, absent until an entry has built them.
+    // /proc/<first child>/ns/{mnt,cgroup,uts}, absent until an entry has built them.
     struct EnvNs {
         int mnt = -1;  // mount namespace
         std::string mntId;  // its nsfs link text ("mnt:[<inode>]"): identifies a pid as the env's
         int cg = -1;   // cgroup namespace rooted at the env group, -1 when the env runs without one
+        int uts = -1;  // UTS namespace carrying the env's hostname, -1 when the env shares the host's
     };
     std::mutex mEnvNsMutex_;
     std::map<std::string, EnvNs> mEnvNs_;

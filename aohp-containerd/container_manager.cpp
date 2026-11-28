@@ -12,6 +12,7 @@
 #include "tar_gz_extract.h"
 #include "unit_manager.h"
 
+#include <cctype>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -586,6 +587,36 @@ static std::string mntNsIdOfPid(const std::string& pid) {
     return link;
 }
 
+// Is this pid in a namespace of the given kind ("mnt", "cgroup", "uts") other than the daemon's?
+static bool nsDiffersFromDaemon(pid_t pid, const char* ns) {
+    char self[64], other[64];
+    std::string p = "/proc/" + std::to_string(pid) + "/ns/" + ns;
+    ssize_t a = readlink((std::string("/proc/self/ns/") + ns).c_str(), self, sizeof(self) - 1);
+    ssize_t b = readlink(p.c_str(), other, sizeof(other) - 1);
+    if (a <= 0 || b <= 0) return false;
+    self[a] = '\0';
+    other[b] = '\0';
+    return strcmp(self, other) != 0;
+}
+
+// The env's hostname: first line of its /etc/hostname, as on any Linux. Called inside the rootfs.
+// Empty when the file is missing or the name is not a plain host name (letters, digits, '-', '.',
+// at most 64 bytes, no leading '-' or '.'); the caller then leaves the inherited name alone.
+static std::string readEnvHostname() {
+    std::ifstream f("/etc/hostname");
+    std::string name;
+    if (!f || !std::getline(f, name)) return "";
+    while (!name.empty() && (name.back() == ' ' || name.back() == '\t' || name.back() == '\r')) name.pop_back();
+    size_t lead = 0;
+    while (lead < name.size() && (name[lead] == ' ' || name[lead] == '\t')) ++lead;
+    name.erase(0, lead);
+    if (name.empty() || name.size() > 64 || name[0] == '-' || name[0] == '.') return "";
+    for (unsigned char c : name) {
+        if (!isalnum(c) && c != '-' && c != '.') return "";
+    }
+    return name;
+}
+
 void ContainerManager::killContainerProcesses(const std::string& rootfs, const std::string& mntId) {
     DIR* proc = opendir("/proc");
     if (!proc) return;
@@ -1026,6 +1057,11 @@ bool ContainerManager::setupBindMounts(const std::string& rootfs) {
 // /proc/<child>/ns/mnt; every later entry setns(2)s into it. The pin keeps the namespace and its
 // mounts alive with zero processes; destroy/reset drop it; after a daemon restart
 // adoptOrphanServicePids() re-pins from a surviving unit pid.
+//
+// The first entry also gives the env a UTS namespace of its own and sets the hostname there from the
+// env's /etc/hostname. Android's init sets the kernel hostname to "localhost" and the env used to
+// share it, so every phone's env called itself "localhost" whatever /etc/hostname said; setting it
+// without a namespace would rename the phone. The UTS namespace is pinned and joined like the others.
 
 ContainerManager::EnvNs ContainerManager::envNs(const std::string& name) {
     std::lock_guard<std::mutex> lock(mEnvNsMutex_);
@@ -1047,15 +1083,23 @@ void ContainerManager::pinEnvNs(const std::string& name, pid_t pid, bool withCgr
         ns.cg = open((base + "cgroup").c_str(), O_RDONLY | O_CLOEXEC);
         if (ns.cg < 0) PLOG(WARNING) << "env " << name << ": pin cgroup namespace " << base << "cgroup";
     }
+    // Only a UTS namespace of the env's own: when the unshare failed the child is still in the
+    // host's, and there is nothing to join.
+    if (nsDiffersFromDaemon(pid, "uts")) {
+        ns.uts = open((base + "uts").c_str(), O_RDONLY | O_CLOEXEC);
+        if (ns.uts < 0) PLOG(WARNING) << "env " << name << ": pin UTS namespace " << base << "uts";
+    }
     std::lock_guard<std::mutex> lock(mEnvNsMutex_);
     if (mEnvNs_.count(name)) {
         // Two first entries raced; the one pinned already wins, the other namespaces are one-off.
         close(ns.mnt);
         if (ns.cg >= 0) close(ns.cg);
+        if (ns.uts >= 0) close(ns.uts);
         return;
     }
     mEnvNs_[name] = ns;
-    LOG(INFO) << "env " << name << ": mount" << (ns.cg >= 0 ? " + cgroup" : "") << " namespace pinned from pid " << pid;
+    LOG(INFO) << "env " << name << ": mount" << (ns.cg >= 0 ? " + cgroup" : "") << (ns.uts >= 0 ? " + UTS" : "")
+              << " namespace pinned from pid " << pid;
 }
 
 void ContainerManager::dropEnvNs(const std::string& name) {
@@ -1064,6 +1108,7 @@ void ContainerManager::dropEnvNs(const std::string& name) {
     if (it == mEnvNs_.end()) return;
     close(it->second.mnt);
     if (it->second.cg >= 0) close(it->second.cg);
+    if (it->second.uts >= 0) close(it->second.uts);
     mEnvNs_.erase(it);
     LOG(INFO) << "env " << name << ": namespaces dropped";
 }
@@ -1074,18 +1119,8 @@ void ContainerManager::dropEnvNs(const std::string& name) {
 // the pid has one of its own).
 void ContainerManager::repinEnvNsFromPid(const std::string& name, pid_t pid) {
     if (envNs(name).mnt >= 0) return;
-    auto differs = [pid](const char* ns) {
-        char self[64], other[64];
-        std::string p = "/proc/" + std::to_string(pid) + "/ns/" + ns;
-        ssize_t a = readlink((std::string("/proc/self/ns/") + ns).c_str(), self, sizeof(self) - 1);
-        ssize_t b = readlink(p.c_str(), other, sizeof(other) - 1);
-        if (a <= 0 || b <= 0) return false;
-        self[a] = '\0';
-        other[b] = '\0';
-        return strcmp(self, other) != 0;
-    };
-    if (!differs("mnt")) return;
-    pinEnvNs(name, pid, differs("cgroup"));
+    if (!nsDiffersFromDaemon(pid, "mnt")) return;
+    pinEnvNs(name, pid, nsDiffersFromDaemon(pid, "cgroup"));
 }
 
 // Child side of an env entry. Protocol with the parent (parentAdmitEnv) over the two pipes:
@@ -1104,6 +1139,9 @@ bool ContainerManager::childEnterEnv(const std::string& rootfs, const EnvNs& pin
         if (pinned.cg >= 0 && setns(pinned.cg, CLONE_NEWCGROUP) != 0) {
             PLOG(WARNING) << "setns(env cgroup namespace)";
         }
+        if (pinned.uts >= 0 && setns(pinned.uts, CLONE_NEWUTS) != 0) {
+            PLOG(WARNING) << "setns(env UTS namespace)";
+        }
         // setns(CLONE_NEWNS) moves root and cwd to the namespace's root. When the first entry had to
         // fall back to chroot that root is still the host's; the rootfs path then resolves and we
         // chroot like it did.
@@ -1120,8 +1158,18 @@ bool ContainerManager::childEnterEnv(const std::string& rootfs, const EnvNs& pin
         // courtesy of the parent), and the cgroup2 mount made below shows that root at /sys/fs/cgroup.
         if (placed == 'R' && unshare(CLONE_NEWCGROUP) != 0) PLOG(WARNING) << "unshare(CLONE_NEWCGROUP)";
         tryUnshareMountNs();
+        // The hostname is set only inside a UTS namespace of our own: without one, sethostname
+        // would rename the phone.
+        bool ownUts = unshare(CLONE_NEWUTS) == 0;
+        if (!ownUts) PLOG(WARNING) << "unshare(CLONE_NEWUTS); the env keeps the host's hostname";
         if (!setupBindMounts(rootfs)) return false;
         if (!enterRootfs(rootfs)) return false;
+        if (ownUts) {
+            std::string host = readEnvHostname();
+            if (!host.empty() && sethostname(host.c_str(), host.size()) != 0) {
+                PLOG(WARNING) << "sethostname " << host;
+            }
+        }
     }
     if (readyFd >= 0) {
         TEMP_FAILURE_RETRY(write(readyFd, &what, 1));
@@ -1628,7 +1676,7 @@ pid_t ContainerManager::spawnInContainer(const std::string& name, const SpawnSpe
                 while ((fe = readdir(fds)) != nullptr) {
                     int fd = atoi(fe->d_name);
                     if (fd > STDERR_FILENO && fd != dfd && fd != syncPipe[1] && fd != readyPipe[1] &&
-                        fd != goPipe[0] && fd != pinned.mnt && fd != pinned.cg)
+                        fd != goPipe[0] && fd != pinned.mnt && fd != pinned.cg && fd != pinned.uts)
                         close(fd);
                 }
                 closedir(fds);
